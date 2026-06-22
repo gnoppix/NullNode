@@ -30,11 +30,14 @@ case "$cmd" in
     relay)
         exec "$VENV/bin/python" "$DIR/relay.py" "$@"
         ;;
+    bootstrap)
+        exec "$VENV/bin/python" "$DIR/bootstrap_server.py" "$@"
+        ;;
     init|id|export|import|contacts|send|chat|p2p|dht)
         exec "$VENV/bin/python" "$DIR/client.py" "$cmd" "$@"
         ;;
     *)
-        echo "usage: ./nullnode.sh <relay|init|id|export|import|contacts|send|chat|p2p|dht>"
+        echo "usage: ./nullnode.sh <relay|bootstrap|init|id|export|import|contacts|send|chat|p2p|dht>"
         exit 1
         ;;
 esac
