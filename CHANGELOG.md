@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-06-22 (cont.)
+
+### Fixed
+- **nullnode.sh used hardcoded `/tmp/nullnode-venv` ignoring local `./venv`** (`nullnode.sh`)
+  - When `install.sh` created a `./venv` alongside the source, `nullnode.sh` still used `/tmp/nullnode-venv` which lacked `websockets`
+  - Fixed: now prefers local `./venv` if present, falls back to `/tmp/nullnode-venv`
+- **Base64 `Incorrect padding` crash on mailbox poll and P2P messages** (`p2p.py`)
+  - `base64.b64decode()` calls on network-received data (mailbox blobs, P2P ciphertext, handshake public keys) failed with `Incorrect padding` when data lacked `=` padding
+  - Fixed: all 5 `b64decode` call sites now pad input to a multiple of 4 and wrap in try/except with warning logs instead of crashing
+
+### Changed
+- **Source header updated** (all 10 code files)
+  - Date range corrected from `2002-2006` to `2002-2026`
+  - Added free-use license line: "You can use the code for free if your company or organisation doesn't have more than 2 people."
+- **install.sh rewritten as standalone curl-pipe bootstrap** (`install.sh`)
+  - Can be used via `curl -fsSL https://raw.githubusercontent.com/gnoppix/NullNode/main/install.sh | bash`
+  - Downloads full source from GitHub (tarball → git clone → individual files fallback)
+  - Re-executes from downloaded copy for proper path resolution
+  - `--no-download` flag for running from an already-cloned repo
+
 ## 2026-06-22
 
 ### Security

@@ -10,7 +10,13 @@
 #-------------------------------------------------------------------------------
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV="/tmp/nullnode-venv"
+
+# Prefer local venv, fall back to /tmp
+if [ -d "${DIR}/venv" ]; then
+    VENV="${DIR}/venv"
+else
+    VENV="/tmp/nullnode-venv"
+fi
 
 if [ ! -d "$VENV" ]; then
     python3 -m venv "$VENV"

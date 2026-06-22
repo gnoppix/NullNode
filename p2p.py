@@ -100,8 +100,14 @@ class PeerConnection:
             if env.type == "p2p-message":
                 seq = env.payload.get("seq", 0)
                 ct_b64 = env.payload.get("ciphertext", "")
+                ct_b64 = ct_b64 + "=" * (-len(ct_b64) % 4)
+                try:
+                    ct = __import__("base64").b64decode(ct_b64).decode()
+                except Exception as e:
+                    logger.warning("base64 decode failed for ciphertext: %s", e)
+                    return None
+
                 claimed_hash = env.payload.get("msg_hash", "")
-                ct = __import__("base64").b64decode(ct_b64).decode()
 
                 # SECURITY: Verify hash matches ciphertext
                 import hashlib
@@ -468,9 +474,14 @@ class P2PNode:
 
         # Verify signature
         peer_fp_b64 = resp.payload.get("public_key", "")
-        peer_fp_from_hello = __import__("base64").b64decode(
-            peer_fp_b64
-        ).decode()
+        peer_fp_b64 = peer_fp_b64 + "=" * (-len(peer_fp_b64) % 4)
+        try:
+            peer_fp_from_hello = __import__("base64").b64decode(
+                peer_fp_b64
+            ).decode()
+        except Exception as e:
+            logger.warning("base64 decode failed for peer public_key: %s", e)
+            return False
 
         if peer_fp_from_hello != peer_fp:
             logger.warning("handshake fingerprint mismatch")
@@ -527,7 +538,17 @@ class P2PNode:
 
             # Verify signature
             peer_fp_b64 = env.payload.get("public_key", "")
-            peer_fp = __import__("base64").b64decode(peer_fp_b64).decode()
+            peer_fp_b64 = peer_fp_b64 + "=" * (-len(peer_fp_b64) % 4)
+            try:
+                peer_fp = __import__("base64").b64decode(peer_fp_b64).decode()
+            except Exception as e:
+                logger.warning("base64 decode failed for peer public_key: %s", e)
+                if STEALTH_MODE:
+                    await ws.send(_stealth_response())
+                else:
+                    await ws.send(Envelope.error("invalid public key encoding").to_json())
+                await ws.close()
+                return
 
             if not validate_fingerprint(peer_fp):
                 if STEALTH_MODE:
@@ -680,7 +701,13 @@ class P2PNode:
 
         for msg in messages:
             blob_b64 = msg.get("value", "")
-            blob = __import__("base64").b64decode(blob_b64).decode()
+            # Fix missing base64 padding
+            blob_b64 = blob_b64 + "=" * (-len(blob_b64) % 4)
+            try:
+                blob = __import__("base64").b64decode(blob_b64).decode()
+            except Exception as e:
+                logger.warning("mailbox: base64 decode failed: %s", e)
+                continue
 
             # Parse: ct_b64|sender_nid|sender_fp|sig
             parts = blob.split("|", 3)
@@ -689,7 +716,12 @@ class P2PNode:
                 continue
 
             ct_b64, sender_nid, sender_fp, sender_sig = parts
-            ct = __import__("base64").b64decode(ct_b64).decode()
+            ct_b64 = ct_b64 + "=" * (-len(ct_b64) % 4)
+            try:
+                ct = __import__("base64").b64decode(ct_b64).decode()
+            except Exception as e:
+                logger.warning("mailbox: base64 decode failed for ciphertext: %s", e)
+                continue
 
             # SECURITY: Verify sender signature before delivering
             # Signature covers: sender_fp|recipient_nid|ct_b64|seq
