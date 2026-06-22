@@ -7,6 +7,16 @@ entirely from a local GPG key pair; the server never sees a real-world identifie
 Messages are encrypted with **ML-KEM (Kyber-768)**, the NIST FIPS-203 post-quantum
 standard, via GnuPG 2.5.20.
 
+In general, you could say it is a messenger that secures text messages with post-quantum encryption, sending them directly to your 
+friends—similar to a BitTorrent for messaging. 
+
+Newer and faster computers will soon make it possible to decrypt today's messages on "normal" chat programs. Furthermore, with backdoors and decryption methods built into these platforms, mass worldwide surveillance becomes effortless.
+
+With NullNode, that is impossible. There is no central server in between, and your messages aren't just strongly encrypted they are super 
+strongly encrypted.
+
+Note: Please consider supporting the project! I simply cannot fund all of the required hosting servers on my own.
+
 ---
 
 ## Features
@@ -31,10 +41,23 @@ standard, via GnuPG 2.5.20.
 
 ---
 
+## Features coming soon
+
+- A cool desktop UI
+- File sharing
+- Voice and video calls
+
+
 ## Quick start
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gnoppix/NullNode/main/install.sh | bash
+```
+
 
 ### Prerequisites
 
+- Gnoppix Linux 26.7
 - Python 3.13+
 - GnuPG 2.5.20 (verify with `gpg --version` -- must list `Kyber` as a public-key
   algorithm)
