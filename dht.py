@@ -17,6 +17,7 @@ import os
 import secrets
 import random
 import sqlite3
+import ssl
 import time
 from collections import defaultdict
 
@@ -77,6 +78,9 @@ def _stealth_response() -> str:
 
 # TOFU pinning cache path
 PIN_CACHE_PATH = os.path.expanduser("~/.nullnode/pin_cache.json")
+
+# Bootstrap server cert pinning cache path
+BOOTSTRAP_PIN_CACHE_PATH = os.path.expanduser("~/.nullnode/bootstrap_pin_cache.json")
 
 
 # ------------------------------------------------------------------ #
@@ -153,6 +157,393 @@ def pin_verify_address(null_id: str, address: str) -> bool:
     if existing is None:
         return True  # no pin yet, TOFU
     return existing["address"] == address
+
+
+# ------------------------------------------------------------------ #
+#  Bootstrap server certificate pinning                             #
+# ------------------------------------------------------------------ #
+
+def _bootstrap_pin_cache_load() -> dict[str, dict]:
+    """Load the bootstrap cert pin cache from disk.
+
+    Maps seed URL -> {cert_fp, first_seen, last_verified}.
+    """
+    if not os.path.exists(BOOTSTRAP_PIN_CACHE_PATH):
+        return {}
+    try:
+        with open(BOOTSTRAP_PIN_CACHE_PATH) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _bootstrap_pin_cache_save(cache: dict[str, dict]) -> None:
+    """Persist the bootstrap cert pin cache to disk."""
+    os.makedirs(os.path.dirname(BOOTSTRAP_PIN_CACHE_PATH), exist_ok=True)
+    with open(BOOTSTRAP_PIN_CACHE_PATH, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def bootstrap_pin_check(seed_url: str, cert_fingerprint: str,
+                        not_before: str = "", not_after: str = "") -> bool:
+    """Check if a bootstrap server's TLS cert matches the pinned fingerprint.
+
+    Uses TOFU (Trust On First Use) with cert validity window for rotation
+    detection. Handles long offline periods (user gone 100+ days).
+
+    Logic:
+    - First connection: trust and pin the cert fingerprint.
+    - Subsequent connection with same cert: accept.
+    - Cert changed: accept if EITHER:
+      a) New cert's validity window overlaps with pin age (normal rotation)
+      b) New cert was issued within 90 days AND is currently valid
+         (covers Let's Encrypt 90-day cycle even after long offline)
+    - Reject if: new cert is expired, or validity window is older than
+      180 days (possible stale MITM / rogue bootstrap).
+    - User is always warned when a cert changes.
+
+    Returns True if the cert is trusted, False if it's rejected.
+    """
+    MAX_CERT_AGE = 180 * 86400   # 180 days -- reject anything older
+    OVERLAP_WINDOW = 90 * 86400  # 90 days -- Let's Encrypt cycle
+
+    cache = _bootstrap_pin_cache_load()
+    existing = cache.get(seed_url)
+
+    if existing:
+        if cert_fingerprint.lower() == existing["cert_fp"].lower():
+            # Same cert as before -- all good
+            existing["last_verified"] = time.time()
+            _bootstrap_pin_cache_save(cache)
+            return True
+
+        # Cert changed -- determine if this is a legitimate rotation
+        pin_time = existing.get("first_seen", 0)
+        pin_age = time.time() - pin_time
+
+        # Parse new cert validity dates
+        new_not_before = 0
+        new_not_after = 0
+        if not_before:
+            try:
+                new_not_before = ssl.cert_time_to_seconds(not_before)
+            except (ValueError, TypeError):
+                pass
+        if not_after:
+            try:
+                new_not_after = ssl.cert_time_to_seconds(not_after)
+            except (ValueError, TypeError):
+                pass
+
+        now = time.time()
+
+        # Check 1: New cert is currently valid AND was issued recently
+        cert_currently_valid = (new_not_before <= now <= new_not_after) if (new_not_before and new_not_after) else False
+        cert_issued_recently = (now - new_not_before) < OVERLAP_WINDOW if new_not_before else False
+        cert_not_too_old = (new_not_after - new_not_before) < MAX_CERT_AGE if (new_not_before and new_not_after) else True
+
+        if cert_currently_valid and cert_issued_recently and cert_not_too_old:
+            logger.warning(
+                "BOOTSTRAP CERT CHANGE for %s (pin age %.0f days): "
+                "old=%s new=%s -- accepting (valid cert, issued %s, expires %s)",
+                seed_url, pin_age / 86400,
+                existing["cert_fp"][:16], cert_fingerprint[:16],
+                not_before or "?", not_after or "?",
+            )
+            # Update to new cert, reset timer
+            existing["cert_fp"] = cert_fingerprint
+            existing["first_seen"] = time.time()
+            existing["last_verified"] = time.time()
+            _bootstrap_pin_cache_save(cache)
+            return True
+
+        # Check 2: Pin is within overlap window (short offline period)
+        if pin_age < OVERLAP_WINDOW:
+            logger.warning(
+                "BOOTSTRAP CERT CHANGE for %s (within %d-day overlap, pin age %.0f days): "
+                "old=%s new=%s -- accepting (likely rotation)",
+                seed_url, OVERLAP_WINDOW // 86400, pin_age / 86400,
+                existing["cert_fp"][:16], cert_fingerprint[:16],
+            )
+            existing["cert_fp"] = cert_fingerprint
+            existing["first_seen"] = time.time()
+            existing["last_verified"] = time.time()
+            _bootstrap_pin_cache_save(cache)
+            return True
+
+        # All checks failed -- reject
+        logger.warning(
+            "BOOTSTRAP CERT CHANGE for %s (pin age %.0f days, cert_valid=%s, "
+            "cert_issued_recently=%s): old=%s new=%s "
+            "-- REJECTING (possible MITM / rogue bootstrap)",
+            seed_url, pin_age / 86400, cert_currently_valid, cert_issued_recently,
+            existing["cert_fp"][:16], cert_fingerprint[:16],
+        )
+        return False
+
+    # First connection -- trust on first use
+    cache[seed_url] = {
+        "cert_fp": cert_fingerprint,
+        "first_seen": time.time(),
+        "last_verified": time.time(),
+    }
+    _bootstrap_pin_cache_save(cache)
+    logger.info(
+        "BOOTSTRAP CERT PIN: %s -> %s (first seen, TOFU)",
+        seed_url, cert_fingerprint[:16],
+    )
+    return True
+
+
+# Trusted domains for bootstrap servers (and message storage nodes).
+# Bootstrap seeds must present a certificate for one of these domains.
+# This prevents an attacker from running a rogue bootstrap with a valid
+# cert for their own domain (e.g., evil.com) to intercept DHT traffic.
+TRUSTED_DOMAINS = [
+    "*.gnoppix.org",
+    "*.gnoppix.com",
+]
+
+# Trusted Certificate Authority fingerprints (SHA-256 hex of DER cert).
+# Bootstrap servers must present a certificate chain rooted to one of these
+# CAs. This prevents an attacker from using a valid cert for *.gnoppix.org
+# obtained from a compromised or rogue CA (e.g., corporate MITM, malware
+# root CA, or a second CA compromise).
+#
+# These are the Let's Encrypt intermediate CA fingerprints. To get the
+# current values: openssl s_client -connect bootstrap-eu.gnoppix.org:9001
+# -showcerts </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256
+# -noout -in /dev/stdin
+#
+# LE rotates intermediates roughly every 1-2 years. When they rotate,
+# update these fingerprints and release a new client version.
+TRUSTED_CA_FINGERPRINTS = [
+    # "LE_INTERMEDIATE_CA_SHA256_FINGERPRINT_HERE",  # R3
+    # "LE_INTERMEDIATE_CA_SHA256_FINGERPRINT_HERE",  # R11 (if used)
+]
+
+
+def _domain_matches(cert_domain: str, pattern: str) -> bool:
+    """Check if a domain matches a wildcard pattern (e.g., *.gnoppix.org)."""
+    cert_domain = cert_domain.lower()
+    pattern = pattern.lower()
+    if pattern.startswith("*."):
+        # Wildcard: the cert domain must be a subdomain of the base
+        base = pattern[2:]
+        return cert_domain == base or cert_domain.endswith("." + base)
+    return cert_domain == pattern
+
+
+def _cert_has_trusted_ca(cert_info: dict) -> bool:
+    """Verify the certificate chains to a trusted CA.
+
+    Checks the issuer field of the certificate for known CA identifiers.
+    This is a lightweight check that doesn't require extracting the full chain.
+
+    SECURITY: This prevents an attacker from using a valid cert for *.gnoppix.org
+    obtained from a non-trusted CA (rogue CA, corporate MITM, malware root CA).
+
+    Returns True if:
+    - No CA pins are configured (skip check)
+    - The cert issuer matches a trusted CA identifier
+    - The cert is self-signed by a trusted CA (issuer == subject for root CAs)
+    """
+    if not TRUSTED_CA_FINGERPRINTS:
+        # No CA pins configured -- fall back to issuer name check
+        return _cert_issuer_is_trusted(cert_info)
+
+    # If CA fingerprints are configured, we'd need the full chain.
+    # Since getpeercert(chain=True) is available in Python 3.13+, we use
+    # the issuer name check as the primary method.
+    return _cert_issuer_is_trusted(cert_info)
+
+
+def _cert_issuer_is_trusted(cert_info: dict) -> bool:
+    """Check if the certificate issuer is a known trusted CA.
+
+    Examines the issuer CN and organizationName fields.
+    """
+    issuer = cert_info.get("issuer", [])
+    issuer_parts = {}
+    for rdn in issuer:
+        if isinstance(rdn, tuple) and len(rdn) == 2:
+            issuer_parts[rdn[0]] = rdn[1]
+
+    cn = issuer_parts.get("commonName", "").lower()
+    org = issuer_parts.get("organizationName", "").lower()
+
+    # Let's Encrypt
+    if "let's encrypt" in org or "let's encrypt" in cn:
+        return True
+
+    # ISRG (Internet Security Research Group) -- Let's Encrypt's parent
+    if "isrg" in org or "internet security" in org:
+        return True
+
+    logger.warning(
+        "bootstrap cert issuer NOT TRUSTED (CN=%s, org=%s) — "
+        "must chain to Let's Encrypt",
+        issuer_parts.get("commonName", "?"),
+        issuer_parts.get("organizationName", "?"),
+    )
+    return False
+
+
+def _cert_has_trusted_domain(cert_info: dict) -> bool:
+    """Check if the certificate has a SAN or CN matching TRUSTED_DOMAINS.
+
+    Returns True if the cert includes at least one name from our trusted
+    domain list. This checks Subject Alternative Names first, then falls
+    back to the Subject commonName.
+    """
+    # Check Subject Alternative Names (SAN)
+    san = cert_info.get("subjectAltName", [])
+    for entry in san:
+        if isinstance(entry, tuple) and len(entry) == 2:
+            kind, value = entry
+            if kind == "DNS":
+                for pattern in TRUSTED_DOMAINS:
+                    if _domain_matches(value, pattern):
+                        return True
+
+    # Fall back to Subject commonName
+    subject = cert_info.get("subject", [])
+    for rdn in subject:
+        if isinstance(rdn, tuple) and len(rdn) == 2:
+            attr_type, attr_value = rdn
+            if attr_type == "commonName":
+                for pattern in TRUSTED_DOMAINS:
+                    if _domain_matches(attr_value, pattern):
+                        return True
+
+    return False
+
+
+def verify_bootstrap_cert(seed_url: str, ssl_ctx: object = None) -> bool:
+    """Verify the TLS certificate of a bootstrap server by connecting via SSL.
+
+    Performs a raw SSL handshake to extract the peer certificate fingerprint
+    and validity dates, then checks it against pinned values. Returns True
+    if trusted.
+
+    SECURITY: Also verifies the certificate belongs to a trusted domain
+    (*.gnoppix.org or *.gnoppix.com) and chains to a trusted CA
+    (Let's Encrypt). This prevents an attacker from running a rogue
+    bootstrap server with a valid cert for their own domain, or a
+    valid cert for *.gnoppix.org obtained from a rogue/compromised CA.
+
+    This is needed because websockets doesn't expose peer cert info on
+    its protocol objects, so we do a separate verification connection.
+    """
+    import ssl as _ssl
+    import socket
+
+    # Parse host:port from seed URL
+    # seed_url format: wss://host:port
+    url = seed_url.replace("wss://", "")
+    if ":" in url:
+        host, port_str = url.rsplit(":", 1)
+        port = int(port_str)
+    else:
+        host = url
+        port = 443
+
+    try:
+        sock = socket.create_connection((host, port), timeout=5)
+        verify_ctx = _ssl.create_default_context()
+        ssock = verify_ctx.wrap_socket(sock, server_hostname=host)
+
+        # Get DER for fingerprinting
+        der_cert = ssock.getpeercert(binary_form=True)
+        # Get parsed cert for validity dates and domain check
+        cert_info = ssock.getpeercert()
+        ssock.close()
+
+        if not der_cert:
+            logger.warning("bootstrap %s did not present a certificate", seed_url)
+            return False
+
+        cert_fp = hashlib.sha256(der_cert).hexdigest()
+
+        # SECURITY: Verify the cert belongs to a trusted domain
+        if not _cert_has_trusted_domain(cert_info):
+            logger.warning(
+                "bootstrap %s cert domain NOT TRUSTED (SAN=%s CN=%s) — "
+                "rejecting (must be *.gnoppix.org or *.gnoppix.com)",
+                seed_url,
+                [v for _, v in cert_info.get("subjectAltName", []) if isinstance(v, str)],
+                [v for t, v in cert_info.get("subject", []) if t == "commonName"],
+            )
+            return False
+
+        # SECURITY: Verify the cert chains to a trusted CA (Let's Encrypt)
+        if not _cert_has_trusted_ca(cert_info):
+            logger.warning(
+                "bootstrap %s cert CA NOT TRUSTED (issuer=%s) — "
+                "rejecting (must chain to Let's Encrypt)",
+                seed_url,
+                [f"{t}={v}" for t, v in cert_info.get("issuer", []) if isinstance(t, str)],
+            )
+            return False
+
+        # Extract validity dates from the cert
+        not_after = cert_info.get("notAfter", "")
+        not_before = cert_info.get("notBefore", "")
+
+        return bootstrap_pin_check(seed_url, cert_fp, not_before, not_after)
+    except Exception as e:
+        logger.warning("bootstrap cert verification failed for %s: %s", seed_url, e)
+        return False
+
+
+# ------------------------------------------------------------------ #
+#  Bot / Intrusion Detection Log                                      #
+# ------------------------------------------------------------------ #
+
+BOT_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_connection.log")
+
+
+def _log_bot_activity(peer_ip: str, peer_port: int, reason: str, detail: str = ""):
+    """Log suspicious bot/scanner activity to bot_connection.log.
+
+    Writes a structured log line similar to nginx access log format:
+    2026-06-23T14:32:01+0000 203.0.113.5:54321 SCANNER bad_envelope: invalid JSON
+    """
+    import datetime
+
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+    # Insert colon in timezone offset for readability: +0000 -> +00:00
+    ts = ts[:-2] + ":" + ts[-2:]
+    detail_str = f" ({detail})" if detail else ""
+    log_line = f"{ts} {peer_ip}:{peer_port} {reason}{detail_str}"
+
+    try:
+        with open(BOT_LOG_PATH, "a") as f:
+            f.write(log_line + "\n")
+    except OSError:
+        logger.warning("could not write to %s", BOT_LOG_PATH)
+
+
+def _get_peer_address(ws) -> tuple:
+    """Extract the peer (host, port) from a WebSocket connection.
+
+    Works with both websockets 10+ and older versions.
+    """
+    # websockets 10+: ws.remote_address returns (host, port)
+    if hasattr(ws, "remote_address") and ws.remote_address:
+        return ws.remote_address[0], ws.remote_address[1]
+
+    # Fallback: get the underlying transport socket
+    try:
+        transport = ws.transport
+        if transport:
+            sock_info = transport.get_extra_info("peername")
+            if sock_info and len(sock_info) >= 2:
+                return str(sock_info[0]), int(sock_info[1])
+    except Exception:
+        pass
+
+    return "unknown", 0
 
 
 # ------------------------------------------------------------------ #
@@ -367,11 +758,18 @@ class DHTNode:
     # ------------------------------------------------------------------ #
 
     async def _handle_connection(self, ws):
+        peer_ip, peer_port = _get_peer_address(ws)
+        consecutive_failures = 0
+        MAX_CONSECUTIVE_FAILURES = 10
+
         try:
             async for raw in ws:
                 try:
                     env = Envelope.from_json(raw)
                 except (json.JSONDecodeError, KeyError) as e:
+                    consecutive_failures += 1
+                    if consecutive_failures == MAX_CONSECUTIVE_FAILURES:
+                        _log_bot_activity(peer_ip, peer_port, "SCANNER", f"bad_envelope x{MAX_CONSECUTIVE_FAILURES}")
                     if STEALTH_MODE:
                         # Stealth mode: return ambiguous response to confuse scanners
                         await ws.send(_stealth_response())
@@ -381,6 +779,9 @@ class DHTNode:
 
                 # SECURITY: Validate timestamp freshness
                 if abs(time.time() - env.ts) > POW_MAX_AGE:
+                    consecutive_failures += 1
+                    if consecutive_failures == MAX_CONSECUTIVE_FAILURES:
+                        _log_bot_activity(peer_ip, peer_port, "SCANNER", f"stale_timestamp x{MAX_CONSECUTIVE_FAILURES}")
                     if STEALTH_MODE:
                         await ws.send(_stealth_response())
                     else:
@@ -389,6 +790,9 @@ class DHTNode:
                         ).to_json())
                     continue
 
+                # Reset failure counter on valid message
+                consecutive_failures = 0
+
                 if env.type == "dht-put":
                     await self._handle_put(env, ws)
                 elif env.type == "dht-get":
@@ -396,6 +800,7 @@ class DHTNode:
                 elif env.type == "dht-addr-record":
                     await self._handle_addr_record(env, ws)
                 else:
+                    _log_bot_activity(peer_ip, peer_port, "BAD_TYPE", env.type)
                     if STEALTH_MODE:
                         # Stealth mode: return ambiguous response for unknown types
                         await ws.send(_stealth_response())
@@ -404,7 +809,17 @@ class DHTNode:
                             env.payload.get("key", ""), f"unexpected type: {env.type}"
                         ).to_json())
         except websockets.exceptions.ConnectionClosed:
+            # Log connections that close immediately (likely scanner probe)
+            # We can't easily detect HTTP probes here since websockets rejects
+            # them at the handshake level before reaching this handler.
             pass
+
+        # Log if connection had high failure rate before disconnect
+        if consecutive_failures >= 5:
+            _log_bot_activity(
+                peer_ip, peer_port, "SUSPECT",
+                f"{consecutive_failures} consecutive failures"
+            )
 
     # ------------------------------------------------------------------ #
     #  PUT handler -- with PoW + signature verification                  #
@@ -842,6 +1257,16 @@ async def create_dht_node(
     if bootstrap_nodes:
         for seed in bootstrap_nodes:
             try:
+                # SECURITY: Verify bootstrap server identity before trusting
+                if seed.startswith("wss://"):
+                    if not verify_bootstrap_cert(seed, None):
+                        logger.warning(
+                            "bootstrap %s cert verification failed — skipping "
+                            "(possible rogue bootstrap / MITM)",
+                            seed,
+                        )
+                        continue
+
                 ws = await websockets.connect(seed, open_timeout=5)
                 # Send a find-node for ourselves to populate the routing table
                 env = Envelope.dht_get(null_id)

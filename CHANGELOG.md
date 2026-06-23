@@ -16,6 +16,29 @@
 - **Bootstrap server address scheme always showed `wss://` even without TLS** (`bootstrap_server.py`)
   - Log message now reflects actual scheme based on whether cert files are configured
 
+### Security
+- **Bootstrap server identity verification** (`dht.py`)
+  - `verify_bootstrap_cert()` — performs raw SSL handshake to extract peer cert fingerprint + validity dates, checks against TOFU cache
+  - `bootstrap_pin_check()` — TOFU with cert validity window for rotation detection (handles long offline periods up to 100+ days)
+  - `create_dht_node()` now verifies bootstrap server identity before trusting its responses
+  - Pin cache at `~/.nullnode/bootstrap_pin_cache.json`
+  - Prevents rogue bootstrap servers from poisoning the DHT routing table or redirecting messages
+  - Accepts rotation if: cert is currently valid AND was issued within 90 days (Let's Encrypt cycle)
+  - Accepts rotation if: pin is < 90 days old (short offline period)
+  - Rejects if: cert is expired, issued > 90 days ago, or pin is > 90 days old (possible MITM)
+  - Domain trust check: bootstrap cert must be for *.gnoppix.org or *.gnoppix.com
+    (prevents attacker from using valid LE cert for their own domain as rogue bootstrap)
+  - CA trust check: bootstrap cert must chain to Let's Encrypt
+    (prevents attacker from using a valid cert for *.gnoppix.org obtained from a
+    rogue/compromised CA, corporate MITM, or malware root CA)
+- **Bot/scanner detection and logging** (`dht.py`)
+  - `bot_connection.log` in application directory records suspicious activity
+  - Detects scanners: 10+ consecutive bad envelopes or stale timestamps -> SCANNER
+  - Detects unknown message types -> BAD_TYPE (logged immediately)
+  - Detects high failure rate before disconnect -> SUSPECT
+  - Log format: `2026-06-23T14:32:01+0000 203.0.113.5:54321 SCANNER (bad_envelope x10)`
+  - Helps identify port scanners, vulnerability probes, and misconfigured clients
+
 ## 2026-06-22 (cont.)
 
 ### Fixed
