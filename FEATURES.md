@@ -46,7 +46,8 @@ when they come back online.
 - **NAT traversal**: STUN protocol + UDP hole punching for clients behind
   home routers. Multiple STUN servers tried with retries.
 - **Bootstrap DHT seeds**: 3 bootstrap nodes help you join the network.
-  They never see message content or metadata.
+  They never see message content or metadata. Bootstrap servers speak TLS
+  directly (no reverse proxy needed).
 - **Stealth mode**: Set `NULLNODE_STEALTH=true` to return ambiguous responses
   to non-client connections. Port scanners and bots receive "HTTP/1.1 400 Bad
   Request" or empty responses instead of "dht-error" JSON, making fingerprint
@@ -83,6 +84,14 @@ when they come back online.
   validated before processing.
 - **Timestamp freshness**: DHT and P2P envelopes rejected if timestamp is
   too far from local clock (5-minute window).
+- **Bootstrap server identity verification**: Client verifies bootstrap server's
+  TLS certificate on every connection. Checks: cert fingerprint (TOFU pin),
+  cert validity window (90-day rotation cycle), trusted domain (*.gnoppix.org
+  or *.gnoppix.com), trusted CA (Let's Encrypt). Rogue bootstrap servers are
+  rejected even with a valid cert for our domain from a compromised CA.
+- **Bot/scanner detection**: Suspicious connections logged to `bot_connection.log`
+  in the application directory. Detects port scanners, vulnerability probes,
+  and misconfigured clients (bad envelopes, stale timestamps, unknown types).
 
 ---
 

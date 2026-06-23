@@ -38,6 +38,8 @@ Note: Please consider supporting the project! I simply cannot fund all of the re
   message delivery with HMAC-authenticated challenge-response.
 - **CLI-first** -- full-featured terminal client; ideal for lean environments,
   SSH sessions, and automation.
+- **Bot/scanner detection** -- suspicious connections logged to
+  `bot_connection.log` in the application directory.
 
 ---
 
@@ -162,6 +164,8 @@ NULLNODE_GNUPGHOME=~/.nullnode-bob ./nullnode.sh p2p --port 9002
 | `NULLNODE_GNUPGHOME` | `~/.nullnode/gnupg` | GPG home directory |
 | `NULLNODE_GPG` | `gpg` | Path to the `gpg` binary |
 | `NULLNODE_DHT_BOOTSTRAP` | (3 built-in seeds) | Comma-separated bootstrap DHT seeds |
+| `NULLNODE_BOOTSTRAP_CERT` | (empty) | Path to TLS certificate (PEM) -- enables wss:// on bootstrap |
+| `NULLNODE_BOOTSTRAP_KEY` | (empty) | Path to TLS private key (PEM) -- enables wss:// on bootstrap |
 
 ---
 
@@ -177,6 +181,37 @@ When you run `p2p`, the node:
 ```bash
 ./nullnode.sh p2p --port 9001
 ```
+
+### Bootstrap seed configuration
+
+Clients connect to bootstrap seeds via the `NULLNODE_DHT_BOOTSTRAP` environment
+variable or the `--bootstrap` flag:
+
+```bash
+export NULLNODE_DHT_BOOTSTRAP="wss://bootstrap-eu.gnoppix.org:9001,wss://bootstrap-us.gnoppix.org:9001"
+```
+
+Or run your own bootstrap and point clients to it:
+
+```bash
+export NULLNODE_DHT_BOOTSTRAP="wss://your-server:9001"
+```
+
+**Running a bootstrap server with TLS:**
+
+```bash
+# Get a certificate (Let's Encrypt)
+certbot certonly --standalone -d bootstrap-eu.gnoppix.org
+
+# Start with TLS
+export NULLNODE_BOOTSTRAP_CERT=/etc/letsencrypt/live/bootstrap-eu.gnoppix.org/fullchain.pem
+export NULLNODE_BOOTSTRAP_KEY=/etc/letsencrypt/live/bootstrap-eu.gnoppix.org/privkey.pem
+export NULLNODE_BOOTSTRAP_PORT=9001
+./nullnode.sh bootstrap
+```
+
+Without the cert env vars, the bootstrap server falls back to plain `ws://`
+(fully backward compatible).
 
 ### Sending a message
 

@@ -317,6 +317,31 @@ Returned on lookup() with full signature + publisher_fp metadata
 - Anti-replay via nonce tracking
 - TOFU pinning prevents DHT address spoofing MITM
 
+**Bootstrap server TLS:**
+- Bootstrap servers speak TLS directly on their listen port (no reverse proxy)
+- `DHTNode.__init__()` accepts `ssl_certfile` and `ssl_keyfile` params
+- `DHTNode.start()` creates `ssl.SSLContext` when both are provided
+- `bootstrap_server.py` reads `NULLNODE_BOOTSTRAP_CERT` and `NULLNODE_BOOTSTRAP_KEY` env vars
+- Without cert env vars, falls back to plain `ws://` (backward compatible)
+
+**Bootstrap server identity verification (client-side):**
+- `verify_bootstrap_cert()` performs raw SSL handshake to extract peer cert fingerprint + validity dates
+- `bootstrap_pin_check()` -- TOFU with cert validity window for rotation detection
+  - Accepts rotation if cert is currently valid AND was issued within 90 days (Let's Encrypt cycle)
+  - Accepts rotation if pin is < 90 days old (short offline period)
+  - Rejects if cert is expired, issued > 90 days ago, or pin is > 90 days old
+- Domain trust check: cert SAN/CN must match `*.gnoppix.org` or `*.gnoppix.com`
+- CA trust check: cert issuer must be Let's Encrypt / ISRG
+- Pin cache at `~/.nullnode/bootstrap_pin_cache.json`
+- Prevents rogue bootstrap servers from poisoning DHT or redirecting messages
+
+**Bot/scanner detection:**
+- `bot_connection.log` in application directory records suspicious activity
+- Detects scanners: 10+ consecutive bad envelopes or stale timestamps -> SCANNER
+- Detects unknown message types -> BAD_TYPE (logged immediately)
+- Detects high failure rate before disconnect -> SUSPECT
+- Log format: `2026-06-23T14:32:01+0000 203.0.113.5:54321 SCANNER (bad_envelope x10)`
+
 **Bootstrap seeds (hardcoded):**
 ```
 wss://bootstrap-eu.gnoppix.org:9001
