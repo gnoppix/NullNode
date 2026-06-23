@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-06-23
+
+### Added
+- **Native TLS support for DHT bootstrap servers** (`dht.py`, `bootstrap_server.py`)
+  - `DHTNode.__init__()` accepts `ssl_certfile` and `ssl_keyfile` params
+  - `DHTNode.start()` creates an `ssl.SSLContext` when both are provided, passes it to `websockets.serve()`
+  - Address scheme is now `wss://` when TLS is active, `ws://` otherwise (no more hardcoded `wss://`)
+  - `create_dht_node()` factory forwards the new TLS params
+  - `bootstrap_server.py` reads `NULLNODE_BOOTSTRAP_CERT` and `NULLNODE_BOOTSTRAP_KEY` env vars
+  - No reverse proxy needed -- bootstrap server speaks TLS directly on its listen port
+  - Fully backward compatible: without cert env vars, falls back to plain `ws://`
+
+### Fixed
+- **Bootstrap server address scheme always showed `wss://` even without TLS** (`bootstrap_server.py`)
+  - Log message now reflects actual scheme based on whether cert files are configured
+
 ## 2026-06-22 (cont.)
 
 ### Fixed

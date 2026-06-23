@@ -24,6 +24,8 @@ Environment variables:
   NULLNODE_BOOTSTRAP_PORT    Listen port (default: 9001)
   NULLNODE_BOOTSTRAP_HOST    Bind address (default: 0.0.0.0)
   NULLNODE_BOOTSTRAP_ID      Null ID for this node (default: auto-generated)
+  NULLNODE_BOOTSTRAP_CERT    Path to TLS certificate (PEM) — enables wss://
+  NULLNODE_BOOTSTRAP_KEY     Path to TLS private key (PEM) — enables wss://
   NULLNODE_STEALTH           Set to "true" to enable stealth mode
 """
 
@@ -47,6 +49,8 @@ logger = logging.getLogger("bootstrap")
 HOST = os.environ.get("NULLNODE_BOOTSTRAP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NULLNODE_BOOTSTRAP_PORT", "9001"))
 NID = os.environ.get("NULLNODE_BOOTSTRAP_ID", "")
+SSL_CERTFILE = os.environ.get("NULLNODE_BOOTSTRAP_CERT", "")
+SSL_KEYFILE = os.environ.get("NULLNODE_BOOTSTRAP_KEY", "")
 
 
 def _generate_nid() -> str:
@@ -67,11 +71,13 @@ async def main():
     logger.info("  listen  : %s:%d", HOST, PORT)
 
     store = DHTStore(db_path=os.path.expanduser("~/.nullnode/bootstrap_dht.db"))
-    node = DHTNode(nid, HOST, PORT, fingerprint="", store=store)
+    node = DHTNode(nid, HOST, PORT, fingerprint="", store=store,
+                   ssl_certfile=SSL_CERTFILE, ssl_keyfile=SSL_KEYFILE)
     await node.start(PORT)
 
     actual_port = node.port
-    logger.info("  address : wss://%s:%d", HOST, actual_port)
+    scheme = "wss" if (SSL_CERTFILE and SSL_KEYFILE) else "ws"
+    logger.info("  address : %s://%s:%d", scheme, HOST, actual_port)
     logger.info("  node ID : 0x%x", node.node_id)
     logger.info("  ready — waiting for DHT connections")
 

@@ -302,6 +302,8 @@ class DHTNode:
         port: int = 0,
         fingerprint: str = "",
         store: DHTStore | None = None,
+        ssl_certfile: str = "",
+        ssl_keyfile: str = "",
     ):
         self.nid = null_id
         self.fingerprint = fingerprint
@@ -310,6 +312,8 @@ class DHTNode:
         self.port = port
         self.address = ""
         self.store = store or DHTStore()
+        self.ssl_certfile = ssl_certfile
+        self.ssl_keyfile = ssl_keyfile
 
         # Routing table
         self.routing_table: dict[int, list[dict]] = defaultdict(list)
@@ -326,6 +330,13 @@ class DHTNode:
         if not self.port:
             self.port = DHT_PORT + secrets.randbelow(1000)
 
+        ssl_ctx = None
+        if self.ssl_certfile and self.ssl_keyfile:
+            import ssl
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(self.ssl_certfile, self.ssl_keyfile)
+            logger.info("TLS enabled (cert=%s)", self.ssl_certfile)
+
         self._server = await websockets.serve(
             self._handle_connection,
             self.host,
@@ -333,9 +344,11 @@ class DHTNode:
             ping_interval=30,
             ping_timeout=10,
             max_size=MAX_VALUE_SIZE * 2,
+            ssl=ssl_ctx,
         )
         self.port = self._server.sockets[0].getsockname()[1]
-        self.address = f"wss://{self.host}:{self.port}"
+        scheme = "wss" if ssl_ctx else "ws"
+        self.address = f"{scheme}://{self.host}:{self.port}"
         self._running = True
         self._nonce_cleanup_task = asyncio.create_task(self._cleanup_nonces())
         logger.info("DHT node %s listening on %s (id=0x%x)", self.nid, self.address, self.node_id)
@@ -816,10 +829,13 @@ async def create_dht_node(
     bootstrap_nodes: list[str] | None = None,
     use_cache: bool = True,
     fingerprint: str = "",
+    ssl_certfile: str = "",
+    ssl_keyfile: str = "",
 ) -> DHTNode:
     """Create and start a DHT node, optionally joining the network."""
     store = DHTStore()
-    node = DHTNode(null_id, host, port, fingerprint, store)
+    node = DHTNode(null_id, host, port, fingerprint, store,
+                   ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)
     await node.start(port)
 
     # Join the network via bootstrap nodes

@@ -73,8 +73,6 @@ class Relay:
     # ------------------------------------------------------------------ #
     #  Peer relay authentication helpers                                  #
     # ------------------------------------------------------------------ #
-
-    def _peer_token(self, ts: int) -> str:
         """HMAC-based one-time token for peer relay authentication."""
         mac = hmac.new(
             self.peer_secret.encode(),
@@ -237,7 +235,9 @@ class Relay:
         if not self.my_url:
             self.my_url = f"ws://{host}:{port}"
         self._gossip_task = asyncio.create_task(self._gossip_loop())
-        async with websockets.serve(self.handle_client, host, port) as server:
+        async with websockets.serve(
+            self.handle_client, host, port,
+        ) as server:
             self._server = server
             await asyncio.Future()
 
