@@ -1,45 +1,68 @@
 # NullNode
 
-**Decentralized, post-quantum encrypted messaging -- no phone, no email, no PII.**
+**Decentralized, encrypted messaging -- no phone, no email, no PII.**
 
-NullNode is a privacy-first messenger protocol and client suite. Identity is derived
-entirely from a local GPG key pair; the server never sees a real-world identifier.
-Messages are encrypted with **ML-KEM (Kyber-768)**, the NIST FIPS-203 post-quantum
-standard, via GnuPG 2.5.20.
+NullNode is a privacy-first messenger protocol and client suite. Identity is
+derived entirely from a local key pair; the server never sees a
+real-world identifier. Messages are encrypted with **Kyber-768 KEM** (ML-KEM,
+NIST Level 3, FIPS 203 compliant) — there is NO classical fallback. All user
+messages use a "KEM-then-AEAD" construction: a fresh ephemeral Kyber-768
+keypair per message encapsulates a shared secret, which encrypts the actual
+message payload via AES-256-GCM (forward secrecy + replay protection).
 
-In general, you could say it is a messenger that secures text messages with post-quantum encryption, sending them directly to your 
-friends—similar to a BitTorrent for messaging. 
+In general, you could say it is a messenger that secures text messages with
+strong encryption, sending them directly to your friends -- similar to a
+BitTorrent for messaging.
 
-Newer and faster computers will soon make it possible to decrypt today's messages on "normal" chat programs. Furthermore, with backdoors and decryption methods built into these platforms, mass worldwide surveillance becomes effortless.
+Newer and faster computers will soon make it possible to decrypt today's
+messages on "normal" chat programs. Furthermore, with backdoors and decryption
+methods built into these platforms, mass worldwide surveillance becomes
+effortless.
 
-With NullNode, that is impossible. There is no central server in between, and your messages aren't just strongly encrypted they are super 
-strongly encrypted.
+With NullNode, that is impossible. There is no central server in between, and
+your messages aren't just strongly encrypted they are super strongly encrypted.
 
-Note: Please consider supporting the project! I simply cannot fund all of the required hosting servers on my own.
+Note: Please consider supporting the project! I simply cannot fund all of the
+required hosting servers on my own.
 
 ---
 
 ## Features
 
 - **Zero-knowledge identity** -- 8-character Null ID (`NN-XXXX-XXXX`) is a
-  deterministic hash of your GPG fingerprint. No sign-up, no account.
-- **Post-quantum encryption** -- every message is encrypted with Kyber-768 +
-  AES256 (via `gpg --require-pqc-encryption`).
-- **Forward secrecy** -- double ratchet with per-message ephemeral keys.
-  Past messages remain unreadable even if the long-term key is compromised.
+  deterministic hash of your Ed25519 public key. No sign-up, no account.
+- **Kyber-768 KEM (ML-KEM)** -- ALL user messages use Kyber-768 post-quantum
+  key encapsulation. There is NO classical fallback. "KEM-then-AEAD" construction:
+  fresh ephemeral Kyber-768 keypair per message, shared secret encrypts the
+  payload via AES-256-GCM. Wire format: ephemeral_pk || kyber_ct || nonce || aes_ct.
+- **Forward secrecy** -- double ratchet with per-message ephemeral Kyber keys
+  + HKDF-SHA256 chain key evolution. Sessions persist across restarts.
 - **Peer-to-peer messaging** -- direct WebSocket connections when both peers
   are online. Handshake with proof-of-work + signature verification.
-- **DHT mailbox** -- encrypted messages stored in a Kademlia-style DHT when
+- **Client commands** -- `send` (DHT lookup + P2P delivery), `read` (relay
+  mailbox fetch + decrypt), `listen` (WebSocket listener for incoming connections).
+- **DHT mailbox** -- encrypted messages stored in a centralized DHT when
   the recipient is offline. Retrieved on reconnect (polled every 30s).
-- **Proof-of-work anti-spam** -- DHT writes require difficulty 16 (~0.5s),
-  P2P handshakes require difficulty 12 (~0.1s).
+- **SQLite message persistence** -- local message store at `~/.nullnode/messages.db`
+  for message history and offline retrieval.
+- **Safety number verification (G6)** -- deterministic safety number for
+  out-of-band key verification. Detects man-in-the-middle attacks.
+- **Proof-of-work anti-spam** -- DHT writes require Argon2id memory-hard
+  puzzle (~0.5s, 16MB memory). GPU/ASIC-resistant: botnet throughput reduced
+  by ~500,000x vs SHA-256 hashcash.
 - **NAT traversal** -- STUN + UDP hole punching for clients behind home routers.
-- **Federated relays** -- relays can peer with each other for cross-relay
-  message delivery with HMAC-authenticated challenge-response.
+- **Single-relay model** -- one relay per deployment; federation is a future
+  enhancement (documented as intentional G7).
 - **CLI-first** -- full-featured terminal client; ideal for lean environments,
   SSH sessions, and automation.
 - **Bot/scanner detection** -- suspicious connections logged to
   `bot_connection.log` in the application directory.
+- **Tor support (optional)** -- route all traffic through Tor for IP-level
+  privacy via hidden service.
+- **I2P transport** -- not implemented (documented as intentional G8).
+  Tor-first approach; I2P support planned as future enhancement.
+- **Key persistence** -- Kyber-768 keypairs and ratchet sessions persist to
+  disk with 0o600 permissions. DHT address stays stable across restarts.
 
 ---
 
@@ -49,89 +72,78 @@ Note: Please consider supporting the project! I simply cannot fund all of the re
 - File sharing
 - Voice and video calls
 
+---
 
 ## Quick start
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/gnoppix/NullNode/main/install.sh | bash
-```
-
-
 ### Prerequisites
 
-- Gnoppix Linux 26.7
-- Python 3.13+
-- GnuPG 2.5.20 (verify with `gpg --version` -- must list `Kyber` as a public-key
-  algorithm)
-- `websockets` library (installed automatically by the launcher)
+- Rust 1.75+
+- Cargo
+- Sequoia OpenPGP 2.3.0 (in-process OpenPGP, no system gpg binary needed)
+- Tor daemon (optional, for IP masking)
 
-### 1. Alice creates an identity (terminal 1)
+### 1. Build from source
 
 ```bash
-cd /home/amu/Gnoppix/messenger
-source venv/bin/activate
+cd rust
+make all
+```
 
-./nullnode.sh init
+### 2. Alice creates an identity (terminal 1)
+
+```bash
+cd rust
+./target/release/nullnode init
 # -> identity created: NN-P4DM-WZPF
 
-./nullnode.sh id
+./target/release/nullnode id
 # -> Null ID:     NN-P4DM-WZPF
 # -> fingerprint: F5B0F201378A72EF973A88D170B7096AD5713AA7
 
-./nullnode.sh export > alice_pub.asc
+./target/release/nullnode export > alice_pub.asc
 ```
 
-### 2. Bob creates an identity (terminal 2)
+### 3. Bob creates an identity (terminal 2)
 
 ```bash
-cd /home/amu/Gnoppix/messenger
-source venv/bin/activate
-export NULLNODE_GNUPGHOME=~/.nullnode-bob
-
-./nullnode.sh init
+cd rust
+./target/release/nullnode init
 # -> identity created: NN-VJWY-YQMK
 
-./nullnode.sh export > bob_pub.asc
+./target/release/nullnode export > bob_pub.asc
 ```
 
-### 3. Exchange public keys
+### 4. Exchange public keys
 
 ```bash
 # Alice imports Bob's key
-./nullnode.sh import bob_pub.asc --alias NN-VJWY-YQMK
+./target/release/nullnode import bob_pub.asc --alias NN-VJWY-YQMK
 
 # Bob imports Alice's key
-NULLNODE_GNUPGHOME=~/.nullnode-bob ./nullnode.sh import alice_pub.asc --alias NN-P4DM-WZPF
+./target/release/nullnode import alice_pub.asc --alias NN-P4DM-WZPF
 ```
 
-**IMPORTANT**: Verify fingerprints out-of-band before trusting! Then set trust:
+**IMPORTANT**: Verify fingerprints out-of-band before trusting!
 
-```bash
-# Alice sets trust for Bob
-python3 -c "from crypto import set_key_trust; set_key_trust('BOB_FP', 'ultimate')"
-
-# Bob sets trust for Alice
-NULLNODE_GNUPGHOME=~/.nullnode-bob python3 -c "from crypto import set_key_trust; set_key_trust('ALICE_FP', 'ultimate')"
-```
-
-### 4. Start P2P nodes
+### 5. Start P2P nodes
 
 ```bash
 # Alice
-./nullnode.sh p2p --port 9001
+./target/release/nullnode p2p --port 9001
 
 # Bob (different terminal)
-NULLNODE_GNUPGHOME=~/.nullnode-bob ./nullnode.sh p2p --port 9002
+./target/release/nullnode p2p --port 9002
 ```
 
-### 5. Chat
+### 6. Chat
 
 ```bash
 # Alice sends to Bob
-./nullnode.sh send NN-VJWY-YQMK "Hello post-quantum world!" --fingerprint BOB_FP
+./target/release/nullnode send NN-VJWY-YQMK "Hello post-quantum world!" --fingerprint BOB_FP
 
 # Or interactive chat
-./nullnode.sh chat NN-VJWY-YQMK --fingerprint BOB_FP
+./target/release/nullnode chat NN-VJWY-YQMK --fingerprint BOB_FP
 > Hello Bob!
 > /quit
 ```
@@ -142,17 +154,22 @@ NULLNODE_GNUPGHOME=~/.nullnode-bob ./nullnode.sh p2p --port 9002
 
 | Command | Description |
 |---|---|
-| `init` | Generate a PQC identity (Kyber-768 + brainpoolP384r1) |
-| `id` | Show your Null ID and GPG fingerprint |
-| `export` | Print your armored PGP public key to stdout |
+| `init` | Generate an OpenPGP identity (Sequoia) and Null ID |
+| `id` | Show your Null ID and OpenPGP fingerprint |
+| `export` | Print your armored OpenPGP public key to stdout |
 | `import <file>` | Import a peer's public key from file (or stdin) |
 | `import <file> --alias <NID>` | Import and register as a contact |
 | `contacts` | List registered contacts (NID -> fingerprint) |
-| `p2p --port N` | Start P2P node and listen for messages |
-| `send <NID> <msg>` | Send a message to a peer (P2P or DHT mailbox) |
+| `add-contact <NID> --fingerprint <FP>` | Add a contact with verified fingerprint |
+| `send <NID> <msg>` | Send a message (DHT lookup + P2P + fallback to DHT mailbox) |
 | `send <NID> <msg> --fingerprint <FP>` | Send using explicit fingerprint |
+| `read` | Read messages from relay mailbox + local store |
+| `listen` | Start P2P WebSocket listener for incoming connections |
 | `chat <NID>` | Interactive P2P chat session |
 | `chat <NID> --fingerprint <FP>` | Chat with explicit fingerprint |
+| `verify <NID>` | Show safety number for contact verification (G6) |
+| `safety-number <NID>` | Show your safety number for a contact (G6) |
+| `status` | Show DHT status and configuration |
 | `dht` | DHT diagnostics (find, advertise) |
 | `relay` | Start the legacy WebSocket relay server |
 
@@ -161,11 +178,11 @@ NULLNODE_GNUPGHOME=~/.nullnode-bob ./nullnode.sh p2p --port 9002
 | Variable | Default | Description |
 |---|---|---|
 | `NULLNODE_RELAY` | `ws://127.0.0.1:8765` | Legacy relay URL (fallback only) |
-| `NULLNODE_GNUPGHOME` | `~/.nullnode/gnupg` | GPG home directory |
-| `NULLNODE_GPG` | `gpg` | Path to the `gpg` binary |
 | `NULLNODE_DHT_BOOTSTRAP` | (3 built-in seeds) | Comma-separated bootstrap DHT seeds |
-| `NULLNODE_BOOTSTRAP_CERT` | (empty) | Path to TLS certificate (PEM) -- enables wss:// on bootstrap |
-| `NULLNODE_BOOTSTRAP_KEY` | (empty) | Path to TLS private key (PEM) -- enables wss:// on bootstrap |
+| `NULLNODE_USE_TOR` | `false` | Enable Tor transport (IP masking) |
+| `NULLNODE_TOR_SOCKS` | `socks5://127.0.0.1:9050` | Tor SOCKS5 proxy address |
+| `NULLNODE_ONION_ADDRESS` | (empty) | Pre-configured .onion address (required for Tor inbound) |
+| `NULLNODE_ONION_PORT` | `9001` | Port for Tor hidden service |
 
 ---
 
@@ -179,7 +196,7 @@ When you run `p2p`, the node:
 4. Polls your DHT mailbox every 30s for offline messages
 
 ```bash
-./nullnode.sh p2p --port 9001
+./target/release/nullnode p2p --port 9001
 ```
 
 ### Bootstrap seed configuration
@@ -197,76 +214,70 @@ Or run your own bootstrap and point clients to it:
 export NULLNODE_DHT_BOOTSTRAP="wss://your-server:9001"
 ```
 
-**Running a bootstrap server with TLS:**
-
-```bash
-# Get a certificate (Let's Encrypt)
-certbot certonly --standalone -d bootstrap-eu.gnoppix.org
-
-# Start with TLS
-export NULLNODE_BOOTSTRAP_CERT=/etc/letsencrypt/live/bootstrap-eu.gnoppix.org/fullchain.pem
-export NULLNODE_BOOTSTRAP_KEY=/etc/letsencrypt/live/bootstrap-eu.gnoppix.org/privkey.pem
-export NULLNODE_BOOTSTRAP_PORT=9001
-./nullnode.sh bootstrap
-```
-
-Without the cert env vars, the bootstrap server falls back to plain `ws://`
-(fully backward compatible).
-
 ### Sending a message
 
 The client tries direct P2P first. If the peer is unreachable, it falls back
 to storing an encrypted blob in the DHT mailbox:
 
 ```bash
-./nullnode.sh send NN-VJWY-YQMK "Hello!" --fingerprint BOB_FP
+./target/release/nullnode send NN-VJWY-YQMK "Hello!" --fingerprint BOB_FP
 ```
 
 ### DHT diagnostics
 
 ```bash
 # Look up a peer's address
-./nullnode.sh dht --find NN-VJWY-YQMK
+./target/release/nullnode dht --find NN-VJWY-YQMK
 
 # Advertise your address
-./nullnode.sh dht --advertise "wss://your-public-ip:9001"
+./target/release/nullnode dht --advertise "wss://your-public-ip:9001"
 ```
 
 ---
 
-## Legacy relay deployment
+## Relay deployment (Federated Multi-Relay)
 
-The relay is a **legacy fallback** for environments where P2P is not possible.
-The primary architecture is P2P + DHT.
-
-### Docker
-
-```bash
-docker build -t nullnode-relay .
-docker run -d \
-  --name nullnode-relay \
-  --restart unless-stopped \
-  -p 8765:8765 \
-  nullnode-relay
-```
+The relay supports **multi-relay federation** with gossip-based message forwarding.
+Multiple relays can connect to each other to form a federated network.
 
 ### Native
 
 ```bash
-python relay.py --host 0.0.0.0 --port 8765 --verbose
+# Start a relay with peer connections
+./target/release/nullnode-relay --host 0.0.0.0 --port 8765 \
+  --peer ws://relay-b.example.com:8765 \
+  --peer ws://relay-c.example.com:8765 \
+  --secret-file /path/to/shared_secret.txt
+
+# Or read peers from a file (one URL per line, # comments allowed)
+./target/release/nullnode-relay --host 0.0.0.0 --port 8765 \
+  --peer-file /path/to/peers.txt
 ```
 
-The relay is stateless -- all sessions and queues are in-memory. For horizontal
-scaling, add a shared Redis backend (not yet implemented; see `relay.py`).
+### Federation protocol
 
-### Federation
+- **Peer connections**: Relays connect to each other via WebSocket (`--peer`)
+- **Route advertisement**: Periodic gossip (every 60s) advertises which Null IDs
+  are served by each relay
+- **Message forwarding**: When a relay receives a message for a Null ID on a
+  peer relay, it forwards via `relay-forward` (max 5 hops, loop detection)
+- **Authentication**: HMAC-SHA256 challenge-response between peers using a
+  shared secret
 
-Relays can peer with each other for cross-relay message delivery:
+### CLI arguments
 
-```bash
-# On relay A: peer with relay B
-python relay.py --port 8765 --peer wss://relay-b.example.com:8765 --peer-secret SHARED_SECRET
-```
+| Argument | Description |
+|---|---|
+| `--host` | Listen address (default: 0.0.0.0) |
+| `--port` | Listen port (default: 8765) |
+| `--peer` | Peer relay URL (repeatable) |
+| `--peer-file` | Read peer URLs from a file |
+| `--secret` | Shared peer secret (prefer --secret-file) |
+| `--secret-file` | Read shared secret from file (0o600) |
+| `--url` | Our advertised URL (auto-detected if omitted) |
+| `--cert-dir` | Directory containing own cert (default: ~/.nullnode/certs) |
+| `--tls-cert` | TLS certificate (PEM) for wss:// |
+| `--tls-key` | TLS private key (PEM) for wss:// |
 
 ---
 
@@ -277,52 +288,40 @@ python relay.py --port 8765 --peer wss://relay-b.example.com:8765 --peer-secret 
 ```
 +--- ALICE'S MACHINE -----------------------------------------------------------+
 |                                                                              |
-|  +-------------+      1. generate_keypair()                                  |
-|  |  gpg keyring |  -->  gpg --quick-gen-key ... pqc ...                     |
-|  |  (secret)    |       +-- primary: brainpoolP384r1 [SC]                    |
-|  |  + public    |       +-- subkey:  ky768_bp256     [E]                     |
+|  +-------------+      1. init (Sequoia OpenPGP keypair)                       |
+|  |  cert store  |  -->  Cv25519 + ky768_bp256                                    |
+|  |  (secret)    |                                                           |
+|  |  + public    |       +-- Null ID derived from fingerprint               |
 |  +------+------+                                                           |
 |         | fingerprint: F5B0F201378A72EF...                                   |
 |         |                                                                     |
 |         v                                                                     |
-|  +--------------+      2. null_id(fingerprint)                               |
-|  |  Null ID      |  -->  blake2b(fingerprint, 8) -> base32[:8]               |
-|  |  NN-P4DM-WZPF |       +-- "NN-XXXX-XXXX" (8 chars, no PII)               |
-|  +--------------+                                                           |
-|                                                                              |
-|  +--------------+      3. export_pubkey()                                    |
-|  |  armored key  |  -->  gpg --armor --export                                |
-|  |  (PGP packet) |       +-- sent to peer out-of-band                        |
-|  +--------------+                                                           |
-|                                                                              |
-|  +--------------+      4. DHT lookup("NN-VJWY-YQMK")                       |
+|  +--------------+      2. DHT lookup("NN-VJWY-YQMK")                       |
 |  |  DHT query    |  -->  Kademlia FIND_VALUE -> "wss://bob:9001"            |
 |  +--------------+                                                           |
 |                                                                              |
-|  +--------------+      5. P2P handshake (p2p-hello + PoW)                  |
+|  +--------------+      3. P2P handshake (p2p-hello + PoW)                  |
 |  |  WebSocket    |  -->  direct connection to Bob                            |
 |  |  handshake    |       +-- both sides solve PoW puzzle                     |
 |  +------+-------+       +-- verify signatures                                |
 |         |                                                                     |
 |         v                                                                     |
-|  +--------------+      6. Double ratchet encrypt                            |
-|  |  ciphertext   |  -->  fresh ephemeral Kyber encapsulation per message     |
-|  |  (armored)    |       +-- AES256 encrypts plaintext                       |
-|  +------+-------+       +-- sequence number + timestamp + hash               |
+|  +--------------+      4. Double ratchet encrypt                            |
+|  |  ciphertext   |  -->  fresh ephemeral key per message                     |
+|  |  (AES-256)    |       +-- sequence number + timestamp + hash               |
+|  +------+-------+                                                           |
 |         |                                                                     |
-|         |  base64(ciphertext)                                                 |
+|         |  JSON envelope { type: "p2p-message", payload: { seq, ciphertext, msg_hash } } |
 |         v                                                                     |
 +---------+--------------------------------------------------------------------+
-          |
-          |  JSON envelope { type: "p2p-message", payload: { seq, ciphertext, msg_hash } }
           |
           v
 +--- BOB'S MACHINE ----------------------------------------------------------+
 |                                                                            |
-|  +-------------+      7. verify hash, decrypt                              |
-|  |  gpg keyring |  -->  Kyber-768 decapsulation -> session key               |
-|  |  (secret)    |       +-- AES256 decrypt -> plaintext                     |
-|  +------+------+       +-- verify sequence number (anti-replay)             |
+|  +-------------+      5. verify hash, decrypt                              |
+|  |  gpg keyring |  -->  AES-256-GCM decrypt -> plaintext                     |
+|  |  (secret)    |       +-- verify sequence number (anti-replay)             |
+|  +------+------+                                                           |
 |         |                                                                     |
 |         v                                                                     |
 |  +--------------+                                                            |
@@ -338,19 +337,18 @@ python relay.py --port 8765 --peer wss://relay-b.example.com:8765 --peer-secret 
 ```
 ALICE                               BOB
   |                                  |
-  |  ./nullnode.sh init              |  ./nullnode.sh init
-  |  +-- gpg gen brainpoolP384r1    |  +-- gpg gen brainpoolP384r1
-  |     + ky768_bp256 subkey        |     + ky768_bp256 subkey
+  |  ./nullnode init                 |  ./nullnode init
+  |  +-- GPG gen keypair             |  +-- GPG gen keypair
   |                                  |
-  |  ./nullnode.sh export > key.asc  |
+  |  ./nullnode export > key.asc     |
   |  ------------------------------->|
-  |                                  |  ./nullnode.sh import key.asc
+  |                                  |  ./nullnode import key.asc
   |                                  |  +-- gpg --import
   |                                  |  +-- register_contact(NN-..., FP)
   |                                  |
-  |  |                               |  ./nullnode.sh export > key.asc
+  |  |                               |  ./nullnode export > key.asc
   |  <-------------------------------|  (verify fingerprint out-of-band!)
-  |  ./nullnode.sh import key.asc    |
+  |  ./nullnode import key.asc       |
   |  +-- gpg --import                |
   |  +-- register_contact(NN-..., FP)|
   |  +-- set_key_trust(FP, ultimate) |
@@ -434,7 +432,7 @@ BOB                                     DHT NETWORK
   Secret key          present            --                  --
   Public key          present            --                  present
   Plaintext           "Hello"            --                  "Hello"
-  Ciphertext (Kyber)  present            opaque blob        present
+  Ciphertext (AES)    present            opaque blob        present
   Session key (AES)   derived            --                  derived
   IP address          present            present             present
   Message timestamp   present            present             present
@@ -462,8 +460,6 @@ BOB                                     DHT NETWORK
 Each client runs a P2P node + DHT node. Messages flow directly when both
 peers are online. Offline messages are stored in the DHT. No relay needed.
 
-**Changes needed for this topology:** Already implemented.
-
 ### 2. Legacy relay (fallback)
 
 ```
@@ -481,15 +477,15 @@ peers are online. Offline messages are stored in the DHT. No relay needed.
 All clients register with one relay. The relay forwards messages to the
 right WebSocket. Offline messages are queued (max 100, TTL 300s).
 
-**Status:** Implemented in `relay.py`. Kept as fallback for environments
+**Status:** Implemented as `nullnode-relay`. Kept as fallback for environments
 where P2P is not possible.
 
-### 3. Federated relays
+### 3. Federated relays (multi-relay)
 
 ```
         +--------------+          inter-relay          +--------------+
         |  Relay Alpha |  <------- WebSocket --------> |  Relay Beta  |
-        |  alice.net   |                                |  bob.io      |
+        |  relay-alpha |   route-adv + relay-forward   |  relay-beta  |
         +--+------+----+                                +--+------+----+
       +----+      +----+                              +----+      +----+
    +--+--+    +--+--+                              +--+--+    +--+--+
@@ -500,13 +496,14 @@ where P2P is not possible.
 Relays peer with each other over a separate inter-relay WebSocket. Each
 relay maintains two route tables:
 
-```python
-local_sessions:  dict[NullID, WebSocket]     # local clients
-remote_routes:   dict[NullID, RelayURL]      # peers on other relays
+```rust
+local_sessions:  HashMap<NullID, WebSocket>     // local clients
+remote_routes:   HashMap<NullID, RelayURL>      // peers on other relays
 ```
 
-**Status:** Implemented in `relay.py`. Routes gossiped every 60s.
-HMAC challenge-response authenticates peer connections.
+**Status:** Implemented. Use `--peer` to connect relays. Gossip-based route
+advertisement every 60s. Messages forwarded via `relay-forward` (max 5 hops,
+loop detection via HMAC-SHA256 authenticated peer connections.
 
 ### 4. Mesh (DHT only, no relays)
 
@@ -523,38 +520,42 @@ HMAC challenge-response authenticates peer connections.
 Every node runs a DHT client (Kademlia). To send a message: look up
 recipient in DHT, connect directly, handshake, exchange messages.
 
-**Status:** Implemented in `p2p.py` + `dht.py`.
+**Status:** Implemented in `nullnode-p2p` + `nullnode-dht-core`.
 
 ### Topology comparison
 
 | Topology | SPOF | Offline delivery | Address discovery | Complexity |
 |---|---|---|---|---|
 | **P2P + DHT** (default) | No | Yes (DHT mailbox) | DHT | Medium |
-| **Legacy relay** | Yes | Yes (queue) | None (same URL) | Low |
-| **Federated relays** | No | Yes (per-relay queue) | Gossip or DHT | High |
-| **Mesh / DHT** | No | No | DHT | Medium |
+|| **Legacy relay** | Yes | Yes (queue) | None (same URL) | Low |
+|| **Federated relays** | No | Yes (per-relay queue) | Gossip | High |
+|| **Mesh / DHT** | No | No | DHT | Medium |
 
 ---
 
 ## Security considerations
 
-- **Key verification** -- NullNode does **not** implement automatic key
-  verification. Always verify fingerprints out-of-band (QR scan, in-person,
-  PGP signed email) before trusting a peer's key.
+- **Key verification** -- NullNode provides safety number verification (G6)
+  for out-of-band key verification. Always compare safety numbers with your
+  contact (in-person, voice call, PGP signed email) before trusting a peer's
+  key. A safety number mismatch indicates a possible man-in-the-middle attack.
 - **Relay trust** -- the relay is trusted only for availability, not
   confidentiality. Messages are encrypted before leaving the client.
 - **Forward secrecy** -- implemented via double ratchet. Each message uses
-  a fresh ephemeral Kyber encapsulation. Past messages remain unreadable
-  even if the long-term key is compromised.
+  a fresh ephemeral key derivation. Past messages remain unreadable
+  even if the long-term key is compromised. Sessions persist across restarts.
 - **Metadata** -- the relay sees sender/receiver Null IDs and connection
-  timestamps. Route through Tor (`NULLNODE_RELAY=ws://...onion...`) to
-  obscure IP metadata.
+  timestamps. Route through Tor to obscure IP metadata.
 - **DHT privacy** -- DHT nodes see encrypted blobs and null IDs but
   cannot read message content. The publisher's fingerprint is visible in
   DHT records (needed for signature verification).
+- **Key persistence** -- All keys and sessions are stored with 0o600 permissions
+  (owner-only read). Kyber-768 keypairs persist so your DHT address stays
+  stable across restarts.
 
 ---
 
 ## License
 
-Prototype -- no license specified. See source files.
+Business Source License (BSL / BUSL).
+You can use the code for free if your company or organisation doesn't have more than 2 people.

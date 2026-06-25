@@ -1,0 +1,25 @@
+[package]
+name = "nullnode-p2p"
+version.workspace = true
+edition.workspace = true
+description = "NullNode P2P client node (handshake, NAT traversal, transport)"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
+futures.workspace = true
+
+nullnode-protocol = { path = "../protocol" }
+nullnode-crypto = { path = "../crypto" }
+
+[lib]
+name = "nullnode_p2p"
+path = "src/lib.rs"

@@ -1,0 +1,35 @@
+[package]
+name = "nullnode-client"
+version.workspace = true
+edition.workspace = true
+description = "NullNode CLI client and identity management"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+rand.workspace = true
+blake2.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+sequoia-openpgp.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tokio-tungstenite.workspace = true
+futures.workspace = true
+
+nullnode-protocol = { path = "../protocol" }
+nullnode-dht-core = { path = "../dht-core" }
+nullnode-p2p = { path = "../p2p" }
+nullnode-crypto = { path = "../crypto" }
+
+[[bin]]
+name = "nullnode"
+path = "src/main.rs"

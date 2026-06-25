@@ -9,92 +9,83 @@ extension points for the NullNode messenger.
 
 ```
 messenger/
-├── crypto.py         # GPG wrapper, key management, encrypt/decrypt, double ratchet
-├── protocol.py       # JSON envelope dataclass, message types, proof-of-work
-├── relay.py          # WebSocket relay (in-memory sessions + queue, federation)
-├── client.py         # CLI entry point and all sub-commands
-├── p2p.py            # P2P node: direct connections, DHT mailbox, handshake
-├── dht.py            # Kademlia-style DHT node with SQLite storage
-├── nat.py            # STUN client + UDP hole punching for NAT traversal
-├── ratelimit.py      # Sliding-window rate limiter (per-key)
-├── nullnode.sh       # Shell launcher (auto-creates venv, dispatches)
-├── Dockerfile        # Multi-arch relay/P2P container
-├── requirements.txt  # Python dependencies (websockets only)
-├── README.md         # User-facing documentation
-└── DEVELOPER.md      # This file
+├── rust/                           # Rust workspace (full implementation)
+│   ├── Cargo.toml                  # Workspace root (8 crates)
+│   ├── Makefile                    # Build system
+│   ├── protocol/                   # Wire protocol, PoW, envelope types
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs              # Module root
+│   │       ├── constants.rs        # DHT/relay/p2p constants
+│   │       ├── envelope.rs         # WireEnvelope, DHT message types, tests
+│   │       └── pow.rs              # Argon2id/SHA-256 PoW solve/check, tests
+│   ├── crypto/                     # Kyber-768 KEM (ALL messages), DoubleRatchetSession
+│   │   ├── Cargo.toml
+│   │   ├── src/
+│   │   │   ├── lib.rs              # encrypt/decrypt (Kyber-768 KEM), ratchet, key derivation
+│   │   │   └── kyber.rs            # Kyber-768 keypair type (re-export from ml-kem)
+│   ├── crypto-utils/               # Ed25519 operations, secure deletion
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── lib.rs              # export_pubkey, import_pubkey, secure_delete
+│   ├── dht-core/                   # DHT storage layer (SQLite, K-bucket, TOFU)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs              # Module root, error types
+│   │       ├── sqlite_store.rs     # DhtStore: SQLite-backed KvRecord storage
+│   │       ├── types.rs            # DhtNode, NodeConfig, RoutingEntry
+│   │       ├── crypto_helpers.rs   # sign/verify, Null ID derivation, constant_time_compare
+│   │       ├── pin_cache.rs        # TOFU pinning cache (JSON file)
+│   │       ├── bootstrap_verify.rs # Bootstrap TLS cert verification
+│   │       ├── ratelimit.rs        # Async sliding-window rate limiter
+│   │       ├── bot_log.rs          # Bot/scanner activity logger
+│   │       └── dht_node.rs         # DhtNodeRuntime (async WebSocket server)
+│   │       └── util.rs             # Timestamp, UUID, hex helpers
+│   ├── p2p/                        # P2P client node library
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs              # P2pNode, P2pConfig
+│   │       ├── handshake.rs        # p2p-hello/-ack with PoW
+│   │       ├── nat.rs              # STUN + hole punching
+│   │       ├── peer.rs             # Peer connection management
+│   │       ├── protocol.rs         # Message types
+│   │       ├── transport.rs        # Direct + SOCKS5/Tor WebSocket
+│   │       ├── tor.rs              # Tor hidden service manager
+│   │       └── util.rs             # P2P utilities
+│   ├── client/                     # CLI client binary
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs             # init, id, export, import, contacts, send, read, listen, chat, verify, safety-number
+│   ├── relay/                      # Relay server binary (store-and-forward)
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs             # WebSocket relay with rate limiting
+│   ├── bootstrap/                  # Bootstrap DHT server binary
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs             # CLI: --host, --port, --id, --db
+│   └── doc/                        # Generated man pages
+├── LICENSE.md
+├── CHANGELOG.md
+├── DEVELOPER.md                    # This file
+├── FEATURES.md
+├── FAQ.md
+└── README.md
 ```
 
 ---
 
 ## Module contracts
 
-### `crypto.py` — cryptographic layer
+### `nullnode-protocol` — wire format and proof-of-work
 
-This module wraps GnuPG 2.5.20 subprocess calls. It never imports `pynacl`
-or any pure-Python crypto library; all cryptographic operations are delegated
-to the system `gpg` binary.
+The protocol is JSON over WebSocket. Every message is a `WireEnvelope`:
 
-**Key abstraction:**
-
-```python
-# All operations use a GPG homedir set via:
-crypto.GPG_HOME = "~/.nullnode/gnupg"          # default
-crypto.GPG_HOME = os.environ["NULLNODE_GNUPGHOME"]  # override
-```
-
-| Function | Returns | Notes |
-|---|---|---|
-| `generate_keypair()` | `str` (fingerprint) | Creates brainpoolP384r1 + ky768_bp256 key, no passphrase |
-| `null_id(fingerprint)` | `str` (`NN-XXXX-XXXX`) | blake2b -> base32 -> 8-char Null ID |
-| `validate_null_id(nid)` | `bool` | Syntax check only |
-| `validate_null_id_strict(nid, fp)` | `bool` | Verify null_id matches fingerprint hash |
-| `validate_fingerprint(fp)` | `bool` | 32- or 40-char hex check |
-| `encrypt(plaintext, recipient_fp)` | `str` (armored ciphertext) | `--require-pqc-encryption` |
-| `decrypt(armored)` | `str` (plaintext) | Auto-selects secret key from GPG_HOME |
-| `export_pubkey()` | `str` (armored) | Full PGP public key packet |
-| `import_pubkey(armored)` | `str` (fingerprint) | Imports into GPG_HOME, returns fingerprint |
-| `get_fingerprint_from_armored(armored)` | `str \| None` | Read-only inspection |
-| `sign_data(data, fingerprint)` | `str` (base64 sig) | Detached GPG signature |
-| `verify_signature(data, b64_sig, fp)` | `bool` | Verify detached signature |
-| `set_key_trust(fingerprint, level)` | `None` | Explicit trust setting |
-| `register_contact(nid, fingerprint)` | `None` | Writes to `~/.nullnode/contacts.json` |
-| `resolve_contact(nid)` | `str \| None` | Looks up fingerprint for a Null ID |
-| `list_contacts()` | `dict[str, str]` | All registered contacts |
-| `own_identity()` | `(nid, fingerprint)` | Current user's identity tuple |
-
-**Double ratchet (forward secrecy):**
-
-| Class | Notes |
-|---|---|
-| `DoubleRatchetSession(peer_fp, peer_nid, our_fp, is_initiator)` | Per-peer ratchet; in-memory only |
-| `.encrypt_message(plaintext)` | Returns `(ciphertext_armored, seq, msg_hash)` |
-| `.decrypt_message(ct, claimed_seq, claimed_ts)` | Returns plaintext; enforces anti-replay |
-
-**Design rules:**
-
-1. `_gpg()` always passes `--batch --with-colons` and captures stdout/stderr.
-   Never interactive. No `--trust-model always`.
-2. `encrypt()` and `decrypt()` raise `RuntimeError` on failure — the calling
-   CLI handler is responsible for printing the error.
-3. The contacts JSON file is the only state `crypto.py` manages outside the
-   GPG keyring. It maps Null ID -> GPG fingerprint.
-4. All security-sensitive comparisons use `hmac.compare_digest`.
-5. Secure temp files are overwritten with random bytes before deletion.
-
----
-
-### `protocol.py` — wire format and proof-of-wire
-
-The protocol is JSON over WebSocket. Every message is an `Envelope`:
-
-```python
-@dataclass
-class Envelope:
-    type: MessageType
-    payload: dict
-    msg_id: str     # hex string, 16 chars (uuid4)
-    ts: float      # unix timestamp
-    sig: str = ""   # base64-encoded detached GPG signature
+```rust
+pub struct WireEnvelope {
+    pub msg_type: MessageType,
+    pub payload: Value,
+    pub msg_id: String,     // hex string, 16 chars
+    pub ts: f64,            // unix timestamp
+    pub sig: String,        // base64-encoded signature
+}
 ```
 
 **Message types (current):**
@@ -105,7 +96,7 @@ class Envelope:
 | `dht-put` | node -> DHT | Store encrypted blob with PoW |
 | `dht-get` | node -> DHT | Retrieve blob by key |
 | `dht-found` | DHT -> node | Blob found response |
-|| `dht-error` | DHT -> node | Operation failed |
+| `dht-error` | DHT -> node | Operation failed |
 | `dht-addr-record` | node -> DHT | Signed address record (proves key ownership) |
 | **Direct P2P session** | | |
 | `p2p-hello` | peer -> peer | Handshake: public key + PoW |
@@ -131,36 +122,291 @@ class Envelope:
 | `recv` | relay -> client | Receive message |
 | `ack` | relay -> sender | Delivery acknowledgment |
 | `error` | relay -> client | Error notification |
-| `online` / `offline` | client -> relay | Presence (stub) |
 
 **Proof-of-work:**
+```rust
+// Constants defined in protocol/src/constants.rs
+pub const DHT_POW_DIFFICULTY: u8 = 16;  // 16 leading zero bits
+pub const P2P_POW_DIFFICULTY: u8 = 12;  // 12 leading zero bits
 
-```python
-DHT_POW_DIFFICULTY = 16   # ~0.5s on modern CPU, ~65k attempts
-P2P_POW_DIFFICULTY = 12   # ~0.1s on modern CPU
-
-pow_solve(data, difficulty) -> int   # find valid nonce
-pow_check(data, nonce, difficulty) -> bool  # verify
+// Functions in protocol/src/pow.rs
+pow_check(data, nonce, difficulty) -> Result<bool, PowError>  // Argon2id-only verification (no SHA-256 fallback)
+pow_solve(data, difficulty) -> Result<Option<u64>, PowError>   // Argon2id-only solver
+sha256_hex(data) -> String                                  // SHA-256 for fingerprinting (NOT for PoW)
 ```
 
-**Adding a new message type:**
-
-1. Add the literal string to `MessageType`.
-2. Add a `@classmethod` factory to the `Envelope` class.
-3. Handle the new type in the appropriate handler (`relay.Relay._handle_envelope`
-   for relay messages, `dht.DHTNode._handle_connection` for DHT, `p2p.P2PNode._handle_connection` for P2P).
+**SECURITY NOTE (H1):** SHA-256 PoW functions (`sha256_pow_check`, `sha256_pow_solve`) have been removed.
+They provided an insecure fallback path that could be exploited to bypass GPU/ASIC-resistant Argon2id
+memory-hard PoW. If Argon2id memory allocation fails, the operation fails hard.
 
 ---
 
-### `relay.py` — WebSocket relay (legacy fallback)
+**Adding a new message type:**
 
-The `Relay` class maintains in-memory structures:
+1. Add the variant to `MessageType` in `protocol/src/envelope.rs`.
+2. Add a constructor if needed.
+3. Handle the new type in the appropriate handler (`relay/src/main.rs`,
+   `dht-core/src/dht_node.rs`, `p2p/src/peer.rs`).
 
-```python
-self.sessions: dict[str, set[WebSocket]]       # Null ID -> active connections
-self.message_queue: dict[str, list[(ts, Env)]]  # Offline -> queued messages
-self.remote_routes: dict[str, (url, ts)]     # Federated relay routes
-self.peer_relays: dict[str, WebSocket]        # Authenticated peer relay connections
+---
+
+### `nullnode-crypto` — Kyber-768 KEM encryption, forward secrecy, and key persistence
+
+**ALL user messages use Kyber-768 KEM (ML-KEM, NIST Level 3). There is NO classical fallback.**
+
+```rust
+// Encrypt plaintext for a recipient using Kyber-768 KEM (mandatory)
+// Generates ephemeral keypair, encapsulates shared secret, derives AES key via HKDF
+encrypt(plaintext: &str, recipient_kyber_enc: &KyberEncapsulationKey) -> Result<String, CryptoError>
+
+// Decrypt ciphertext using our Kyber-768 decapsulation key
+decrypt(ciphertext_hex: &str, our_kyber_dec: &KyberDecapsulationKey) -> Result<String, CryptoError>
+```
+
+**KyberKeypair persistence (G10):**
+
+```rust
+// Generate a new keypair
+KyberKeypair::generate() -> Result<KyberKeypair, CryptoError>
+
+// Save to file (hex-encoded JSON, 0o600 permissions)
+kp.save(path: &Path) -> Result<(), CryptoError>
+
+// Load from file
+KyberKeypair::load(path: &Path) -> Result<KyberKeypair, CryptoError>
+
+// Load or generate (convenience method)
+KyberKeypair::load_or_generate(path: &Path) -> Result<KyberKeypair, CryptoError>
+```
+
+**DoubleRatchetSession (Kyber-768 KEM + forward secrecy + persistence):**
+
+```rust
+// Initialize a new session with paired fingerprints
+DoubleRatchetSession::new(peer_fp, peer_nid, our_fp, is_initiator) -> Result<Self, CryptoError>
+
+// Encrypt a message: fresh ephemeral Kyber-768 keypair + chain key evolution
+session.encrypt_message(plaintext: &str, peer_kyber_enc: &KyberEncapsulationKey) -> Result<String, CryptoError>
+
+// Decrypt a message: decapsulate Kyber ciphertext + chain key evolution
+session.decrypt_message(message: &str, our_kyber_keypair: &KyberKeypair) -> Result<String, CryptoError>
+
+// Persistence (G9): save/load session state to/from JSON file
+session.serialize() -> Result<String, CryptoError>
+DoubleRatchetSession::deserialize(json: &str) -> Result<Self, CryptoError>
+session.save(path: &Path) -> Result<(), CryptoError>
+DoubleRatchetSession::load(path: &Path) -> Result<Self, CryptoError>
+
+**KEM-then-AEAD construction:**
+1. Generate fresh ephemeral Kyber-768 keypair per message
+2. Encapsulate shared secret with recipient's static public key
+3. Combine shared secret with ratchet chain key via SHA-256
+4. Derive AES-256-GCM key via HKDF-SHA256
+5. Wire format: `ephemeral_pk (1184B) || kyber_ct (1088B) || nonce (12B) || aes_ct`
+
+**Design rules:**
+
+1. `encrypt()` and `decrypt()` return `CryptoResult` — callers must handle errors.
+2. Ratchet state can be persisted via `save()`/`load()` for session survival across restarts.
+3. Key derivation uses HKDF-SHA256.
+4. All random values use `rand::thread_rng()` (cryptographic).
+5. **NO classical fallback** — Kyber-768 KEM is mandatory for all user messages.
+6. Each message uses a unique ephemeral keypair (forward secrecy).
+7. Kyber keys are persisted with 0o600 permissions (owner-only read).
+8. Persistence files use JSON format for auditability.
+
+---
+
+### `nullnode-crypto-utils` — OpenPGP and secure utilities
+
+In-process Sequoia OpenPGP operations (no shell-out to gpg binary).
+
+```rust
+// OpenPGP operations (Sequoia in-process)
+export_pubkey() -> CryptoUtilsResult<String>              // Armor the cert
+import_pubkey(armored: &str) -> CryptoUtilsResult<String> // Import cert, returns fingerprint
+get_fingerprint_from_armored(armored: &str) -> CryptoUtilsResult<String>  // Extract fingerprint
+get_own_fingerprint() -> CryptoUtilsResult<String>         // Read own cert from disk
+
+// Fingerprint and Null ID utilities
+validate_fingerprint(fp: &str) -> bool                    // 32 or 40 hex chars
+null_id_from_fingerprint(fp: &str) -> String              // NN-XXXX-XXXX via SHA-256
+
+// Secure file deletion (overwrite with random, fsync, unlink)
+secure_delete(path: &str) -> CryptoUtilsResult<()>
+```
+
+**Design rules:**
+
+1. All OpenPGP operations use the Sequoia OpenPGP library (in-process, no shell-out).
+2. Fingerprints must be validated (32 or 40 hex chars) before use.
+3. Certs are cached in dht-core and relay for TOFU-based verification.
+4. `secure_delete` is best-effort (CoW filesystems may not fully erase).
+
+---
+
+### `nullnode-dht-core` — Kademlia DHT node
+
+```rust
+// Configuration
+NodeConfig {
+    null_id: String,          // NN-XXXX-XXXX
+    fingerprint: String,      // GPG fingerprint
+    host: String,
+    port: u16,
+    db_path: Option<String>,  // SQLite file
+    // ... more fields
+}
+
+// Async runtime
+DhtNodeRuntime::new(config).await -> Self
+runtime.start().await -> Result<()>
+
+// Storage (via nullnode-dht-core/sqlite_store.rs)
+DhtStore::new(path: &str) -> Self
+store.put(key, value, salt, seq, publisher_fp, ttl) -> Result<()>
+store.get(key) -> Option<KvRecord>
+
+// TOFU pinning
+pin_get(null_id: &str) -> Option<String>
+pin_update(null_id: &str, address: &str) -> Result<()>
+pin_verify_address(null_id: &str, address: &str) -> bool
+
+// Certificate verification (bootstrap TLS)
+verify_bootstrap_cert(seed_url: &str, pin_cache: &Path) -> Result<CertInfo>
+bootstrap_pin_check(seed_url: &str, cert_fp: &str, not_before: &str, not_after: &str) -> bool
+/// SECURITY NOTE (G4): First-time bootstrap pins log a warning to alert users
+/// about TOFU trust decisions.
+
+// Domain/cert validation helpers (public)
+domain_matches(cert_domain: &str, pattern: &str) -> bool
+cert_has_trusted_domain(cert_info: &CertInfo) -> bool
+cert_issuer_is_trusted(cert_info: &CertInfo) -> bool
+
+// Constant-time comparison (prevents timing attacks on fingerprint comparison)
+constant_time_compare(a: &str, b: &str) -> bool
+```
+
+**DHT constants:**
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `DHT_PORT` | 6881 | Default DHT port |
+| `K_BUCKET_SIZE` | 8 | Entries per routing bucket |
+| `STORE_TTL` | 86400 s | Message TTL (24h) |
+| `ADDR_TTL` | 7200 s | Address record TTL (2h) |
+| `MAX_VALUE_SIZE` | 4096 | Max encrypted blob size |
+| `MAX_STORE_PER_KEY` | 100 | Max messages per mailbox |
+| `POW_MAX_AGE` | 300 s | PoW nonce validity window |
+
+**Address ownership verification (dht-addr-record):**
+```
+Publisher signs: null_id|address|ttl
+Signature verified against publisher's OpenPGP cert (in-process via Sequoia)
+null_id must equal compute_null_id(publisher_fp)  (proves key ownership)
+Stored in DHT with salt prefix "addr:" to distinguish from mailbox data
+```
+
+**TOFU pinning:**
+- First address received for a null_id is trusted and pinned to disk
+- Subsequent addresses for the same null_id must match the pin
+- Pin mismatch logs a warning and rejects the address (possible MITM)
+- Pin cache stored at `~/.nullnode/pin_cache.json`
+
+**Security:**
+- Every `dht-put` requires valid PoW (difficulty 16)
+- Publisher must sign `key|value|salt|seq|nonce`
+- Key must equal publisher's null_id (prevents unauthorized storage)
+- Anti-replay via nonce tracking
+- TOFU pinning prevents DHT address spoofing MITM
+- Rate limiting: connection (50/60s), query (200/60s), max value size (1KB)
+- SECURITY FIX (G7): Fingerprint sanitized before filesystem use to prevent path traversal
+- SECURITY FIX (G9): Rate limiter capped at 100k buckets to prevent memory exhaustion
+- SECURITY FIX (G8): Session serialization includes pending ciphertext (necessary for reliability);
+  stored with 0o600 permissions. Consider encrypted filesystem for high-security.
+- SECURITY FIX (G10): PoW parameters validated (nonce range, difficulty) before hashing.
+
+---
+
+### `nullnode-p2p` — P2P client node
+
+```rust
+// Configuration
+P2pConfig {
+    nid: String,
+    fingerprint: String,
+    bootstrap: Vec<String>,
+    transport: TransportConfig,
+}
+
+// Peer node
+P2pNode::new(config) -> Self
+node.start().await -> Result<()>
+node.send_message(peer_nid, peer_fp, text) -> Result<bool>
+```
+
+**Transport layer (`p2p/src/tor.rs`, `p2p/src/transport.rs`):**
+
+```rust
+TransportConfig {
+    use_tor: bool,
+    tor_socks_host: String,
+    tor_socks_port: u16,
+    tor_control_port: u16,
+    tor_control_password: String,
+    onion_port: u16,
+    onion_address: String,  // pre-configured fallback
+}
+
+// Hidden service manager
+TorHiddenServiceManager::new(config) -> Self
+manager.start() -> String       // returns .onion address (or empty)
+manager.stop()                  // cleanup
+manager.is_available() -> bool   // Tor SOCKS reachable?
+manager.get_onion_address() -> String
+
+// Helpers
+build_onion_uri(onion: &str, port: u16) -> String   // wss://{onion}:{port}
+is_onion_address(addr: &str) -> bool
+normalize_peer_address(addr: &str, config) -> String
+transport_from_env() -> TransportConfig   // reads NULLNODE_* env vars
+```
+
+**NAT traversal (`p2p/src/nat.rs`):**
+
+```rust
+// STUN-based public endpoint discovery
+StunProtocol::new(host: &str, port: u16) -> Self
+protocol.get_public_endpoint() -> Result<(String, u16)>
+protocol.parse_response(data: &[(u8, SocketAddr)]) -> Option<(String, u16)>
+
+// UDP hole punching
+hole_punch(local_port: u16, peer_ip: &str, peer_port: u16) -> Option<UdpSocket>
+
+// Tor connection
+connect_through_tor(socks_addr: &SocketAddr, target_host: &str, target_port: u16)
+    -> MaybeTlsStream<TcpStream>
+```
+
+**Design rules:**
+
+1. When `use_tor=True`, ALL outgoing connections go through the Tor SOCKS proxy.
+2. When Tor is enabled, the listener binds on `127.0.0.1` (Tor connects via hidden service).
+3. The `.onion` address is self-authenticating (derived from ed25519 key).
+4. Pin cache at `~/.nullnode/bootstrap_pin_cache.json`.
+5. STUN is optional; Tor removes the need for public endpoint discovery.
+
+---
+
+### `nullnode-relay` — WebSocket relay server
+
+Binary crate producing `nullnode-relay`.
+
+```rust
+// CLI: --host, --port, --peer, --secret
+// Main loop accepts WebSocket connections and routes messages
+RelayState::new() -> Self
+state.handle_connection(ws).await
 ```
 
 **Configurable constants:**
@@ -179,409 +425,218 @@ self.peer_relays: dict[str, WebSocket]        # Authenticated peer relay connect
 | `ROUTE_TTL` | 1800 s | Remote route expiry |
 | `GOSSIP_INTERVAL` | 60 s | Route advertisement interval |
 
-**Federation:**
-
-Relays authenticate peer connections via HMAC challenge-response (`peer_secret`).
-Routes are gossiped every 60s. Cross-relay messages use `relay-forward`
-envelopes. Route discovery uses `who-has` / `route-found` queries.
-
-**Message flow (legacy relay):**
+**Message flow (relay with federation):**
 
 ```
 register:
-  1. Verify signature + null_id matches fingerprint
-  2. Add ws to sessions[null_id]
-  3. Drain message_queue[null_id] (discard expired)
-  4. Send "registered"
+  1. WebSocket connection accepted (ws:// or wss://)
+  2. Per-IP rate limiting check
+  3. Heartbeat loop starts (30s ping/pong)
 
-send:
-  1. Build "recv" envelope from "send" payload
-  2. If recipient in local sessions -> forward, send "ack"
-  3. If recipient in remote_routes -> relay-forward to peer relay
-  4. If unknown -> queue message (max 100, TTL 300s), send "ack"
+relay-store (client -> relay):
+  1. Verify envelope timestamp freshness (+/- 300s)
+  2. Verify sender OpenPGP signature over canonical data (Sequoia in-process)
+  3. Check timestamp freshness (replay protection)
+  4. Check and record nonce (replay protection)
+  5. Store in recipient's mailbox (per-sender cap: 10, global: 1000)
+  6. If recipient in remote_routes -> relay-forward to peer relay
 
-relay-forward:
-  1. Accept only from authenticated peer relays
-  2. Deliver locally or queue for offline recipient
-```
+relay-fetch (client -> relay):
+  1. Verify OpenPGP signature proving requester owns identity (Sequoia in-process)
+  2. Verify null_id matches fingerprint derivation
+  3. Check nonce replay
+  4. Verify HMAC if shared secret configured
+  5. Return mailbox entries (TTL 7 days)
 
-**Extending the relay:**
+route-advertise (relay -> relay):
+  1. Update remote_routes with advertised Null IDs
+  2. Update peer last_seen timestamp
+  3. Respond with route-advertise-ack containing our local Null IDs
 
-- To add persistence, replace `message_queue` with a Redis or SQLite backend.
-- To add clustering, use a shared Redis for `sessions` across relay instances.
+relay-forward (relay -> relay):
+  1. Verify inner GPG signature
+  2. Check hop_count < MAX_RELAY_HOPS (5)
+  3. Loop detection: check via chain doesn't contain us
+  4. Check nonce replay
+  5. Store in local mailbox
+  6. Send relay-forward-ack
 
----
-
-### `p2p.py` — P2P node
-
-The `P2PNode` class combines DHT participation with direct peer connections.
-
-```python
-class P2PNode:
-    # Core
-    nid: str
-    fingerprint: str
-    p2p_port: int = 9001
-
-    # Subsystems
-    _dht: DHTNode | None       # DHT participation
-    _server: asyncio.Server    # Incoming P2P WebSocket server
-
-    # Peer state
-    _peers: dict[str, PeerConnection]  # Active peer connections
-    _sessions: dict[str, DoubleRatchetSession]  # Per-peer ratchet
-```
-
-**`PeerConnection`:** Wraps a WebSocket + `DoubleRatchetSession`.
-- `send(plaintext)` -> encrypts via ratchet, sends `p2p-message`, returns `(seq, msg_hash)`
-- `receive()` -> receives envelope, decrypts, verifies hash, sends `p2p-ack`
-
-**Message flow (P2P send):**
-1. If peer already connected -> send directly via `PeerConnection.send()`
-2. Look up peer address in DHT -> validate signature + TOFU pin
-3. Connect WebSocket (rejected if TOFU pin mismatch)
-4. Perform handshake: `p2p-hello` (with PoW) -> `p2p-hello-ack`
-5. Initialize `DoubleRatchetSession`
-6. If peer offline -> fall back to DHT mailbox (`_store_in_mailbox`)
-
-**DHT mailbox:**
-- Messages encrypted with recipient's public key before storage
-- Signed by sender for authenticity
-- Recipient polls mailbox every 30s (`MAILBOX_POLL_INTERVAL`)
-- Sequence numbers prevent replay
-
-**Handshake:**
-- Both sides solve a PoW puzzle (`P2P_POW_DIFFICULTY = 12`)
-- Public keys exchanged as base64-encoded fingerprints
-- Both sides sign the `p2p-hello` / `p2p-hello-ack` envelopes
-
----
-
-### `dht.py` — Kademlia DHT node
-
-The `DHTNode` class implements a Kademlia-style DHT with persistent storage.
-
-```python
-class DHTNode:
-    node_id: int           # 160-bit, derived from Null ID via SHA-256
-    store: DHTStore        # SQLite-backed persistent storage
-    routing_table: dict[int, list[dict]]  # XOR-distance buckets
-```
-
-**`DHTStore`:** SQLite database (`~/.nullnode/dht_store.db`) with:
-- `kv_store` table: key, value, salt, seq, publisher_fp, stored_at, expires_at, sig
-- WAL mode, foreign keys
-- Automatic expiry via `DELETE WHERE expires_at <= now`
-
-**DHT constants:**
-
-| Constant | Value | Purpose |
-|---|---|---|
-| `DHT_PORT` | 6881 | Default DHT port |
-| `K_BUCKET_SIZE` | 8 | Entries per routing bucket |
-| `STORE_TTL` | 86400 s | Message TTL (24h) |
-| `ADDR_TTL` | 7200 s | Address record TTL (2h) |
-| `MAX_VALUE_SIZE` | 4096 | Max encrypted blob size |
-| `MAX_STORE_PER_KEY` | 100 | Max messages per mailbox |
-| `POW_MAX_AGE` | 300 s | PoW nonce validity window |
-
-**DHT operations:**
-- `store_mailbox(recipient_nid, blob, fp, seq)` -> encrypts, signs, stores with PoW
-- `get_mailbox(my_nid)` -> polls local store + queries DHT network
-- `publish_addr_record(nid, fp, addr)` -> publishes signed address record (proves ownership)
-- `lookup(target_nid)` -> iterative FIND_VALUE query; validates address signature + TOFU pin
-
-**Address ownership verification (dht-addr-record):**
-```
-Publisher signs: null_id|address|ttl
-Signature verified against publisher's GPG fingerprint
-null_id must equal compute_null_id(publisher_fp)  (proves key ownership)
-Stored in DHT with salt prefix "addr:" to distinguish from mailbox data
-Returned on lookup() with full signature + publisher_fp metadata
-```
-
-**TOFU pinning:**
-- First address received for a null_id is trusted and pinned to disk
-- Subsequent addresses for the same null_id must match the pin
-- Pin mismatch logs a warning and rejects the address (possible MITM)
-- Pin cache stored at `~/.nullnode/pin_cache.json`
-- `pin_get(null_id)` -> look up pinned address
-- `pin_update(null_id, address, fp)` -> update/create pin
-- `pin_verify_address(null_id, address)` -> check address against pin
-
-**Security:**
-- Every `dht-put` requires valid PoW (difficulty 16)
-- Publisher must sign `key|value|salt|seq|nonce`
-- Key must equal publisher's null_id (prevents unauthorized storage)
-- `dht-addr-record` requires signature over `null_id|address|ttl`
-- Anti-replay via nonce tracking
-- TOFU pinning prevents DHT address spoofing MITM
-
-**Bootstrap server TLS:**
-- Bootstrap servers speak TLS directly on their listen port (no reverse proxy)
-- `DHTNode.__init__()` accepts `ssl_certfile` and `ssl_keyfile` params
-- `DHTNode.start()` creates `ssl.SSLContext` when both are provided
-- `bootstrap_server.py` reads `NULLNODE_BOOTSTRAP_CERT` and `NULLNODE_BOOTSTRAP_KEY` env vars
-- Without cert env vars, falls back to plain `ws://` (backward compatible)
-
-**Bootstrap server identity verification (client-side):**
-- `verify_bootstrap_cert()` performs raw SSL handshake to extract peer cert fingerprint + validity dates
-- `bootstrap_pin_check()` -- TOFU with cert validity window for rotation detection
-  - Accepts rotation if cert is currently valid AND was issued within 90 days (Let's Encrypt cycle)
-  - Accepts rotation if pin is < 90 days old (short offline period)
-  - Rejects if cert is expired, issued > 90 days ago, or pin is > 90 days old
-- Domain trust check: cert SAN/CN must match `*.gnoppix.org` or `*.gnoppix.com`
-- CA trust check: cert issuer must be Let's Encrypt / ISRG
-- Pin cache at `~/.nullnode/bootstrap_pin_cache.json`
-- Prevents rogue bootstrap servers from poisoning DHT or redirecting messages
-
-**Bot/scanner detection:**
-- `bot_connection.log` in application directory records suspicious activity
-- Detects scanners: 10+ consecutive bad envelopes or stale timestamps -> SCANNER
-- Detects unknown message types -> BAD_TYPE (logged immediately)
-- Detects high failure rate before disconnect -> SUSPECT
-- Log format: `2026-06-23T14:32:01+0000 203.0.113.5:54321 SCANNER (bad_envelope x10)`
-
-**Bootstrap seeds (hardcoded):**
-```
-wss://bootstrap-eu.gnoppix.org:9001
-wss://bootstrap-us.gnoppix.org:9001
-wss://bootstrap-asia.gnoppix.org:9001
+gossip_task (background, every 60s):
+  1. Collect local Null IDs from mailboxes
+  2. Build route-advertise envelope
+  3. Send to all connected peers
+  4. Cleanup expired routes (> 30min) and stale peers (> 5min)
 ```
 
 ---
 
-### `nat.py` — NAT traversal
+### `nullnode-client` — CLI entry point
 
-STUN-based public endpoint discovery + UDP hole punching.
+Binary crate producing `nullnode`.
 
-| Function | Returns | Notes |
-|---|---|---|
-| `get_public_endpoint(servers)` | `(ip, port) \| None` | Tries multiple STUN servers |
-| `hole_punch(local_port, peer_ip, peer_port)` | `socket \| None` | UDP hole punching |
+```rust
+// Commands
+cmd_init(config)       // Generate identity
+cmd_id(config)         // Show Null ID + fingerprint
+cmd_export()           // Print armored public key
+cmd_import(armored)    // Import from file or stdin, returns fingerprint
+cmd_contacts()         // List registered contacts
+cmd_add_contact(nid, fp) // Add a contact with fingerprint
+cmd_send(nid, msg)     // Send message to peer (DHT lookup + P2P delivery)
+cmd_read()             // Read messages from relay mailbox
+cmd_listen(config)     // Start P2P listener for incoming connections
+cmd_chat(nid)          // Interactive P2P chat
+cmd_verify(nid)        // Verify contact safety number (G6)
+cmd_safety_number(nid) // Show safety number for a contact (G6)
+cmd_status()           // Show DHT status
+```
 
-**STUN servers (hardcoded):**
-- `stun.l.google.com:19302`
-- `stun1.l.google.com:19302`
-- `stun2.l.google.com:19302`
-- `stun.stunprotocol.org:3478`
-- `stun.ekiga.net:3478`
-- `stun.ideasip.com:3478`
+**Configuration paths:**
+
+| Path | Purpose |
+|---|---|
+| `~/.nullnode/identity.json` | Own Null ID + fingerprint |
+| `~/.nullnode/contacts.json` | NID -> fingerprint mapping |
+| `~/.nullnode/pin_cache.json` | DHT address TOFU pins |
+| `~/.nullnode/bootstrap_pin_cache.json` | Bootstrap TLS cert TOFU pins |
+| `~/.nullnode/dht_store.db` | SQLite DHT storage |
+| `~/.nullnode/messages.db` | SQLite message store (G5) |
+| `~/.nullnode/kyber_keys.json` | Persisted Kyber keypair (G10) |
+| `~/.nullnode/ratchet_sessions/` | Persisted ratchet sessions (G9) |
 
 ---
 
-### `ratelimit.py` — rate limiter
+### `nullnode-bootstrap` — Bootstrap DHT server
 
-Sliding-window rate limiter used by the relay for connection and message
-rate limiting per source IP.
+Binary crate producing `nullnode-bootstrap`.
 
-```python
-class RateLimiter:
-    def __init__(self, max_per_window: int, window_sec: float = 60.0)
-    def allow(key: str) -> bool
-    def prune() -> None
-    def start_background_prune(interval: float = 300.0)
-    def stop()
+```rust
+// CLI: --host, --port, --id, --db
+// Starts a DHT WebSocket server on the specified port
+// Stores data in SQLite at the specified path
 ```
-
----
-
-### `client.py` — CLI entry point
-
-Every sub-command maps to a function:
-
-```python
-# Synchronous functions:
-cmd_init(args)       # generate_keypair() + print
-cmd_id(args)         # own_identity() + print
-cmd_export(args)     # export_pubkey() + print
-cmd_import(args)     # read file or stdin -> import_pubkey()
-cmd_contacts(args)   # list_contacts() + print
-
-# Async functions (return coroutine):
-cmd_p2p_listen(args) # start P2P node, listen for messages
-cmd_send(args)       # start temp P2P node, send message
-cmd_chat(args)       # interactive P2P chat session
-cmd_dht(args)        # DHT diagnostics (find, advertise)
-```
-
-The `main()` function dispatches via a dict lookup and calls
-`asyncio.run()` for async commands.
-
-**Adding a new command:**
-
-1. Define the handler function (sync or async).
-2. Add a subparser in `main()`.
-3. Wire it into `sync_cmds` or `async_cmds` dict.
-
----
-
-## Cryptographic details
-
-### Key structure (GnuPG 2.5.20 `pqc` algorithm)
-
-```
-Primary key: brainpoolP384r1  [SC]  (sign + certify)
-     |
-Subkey:      ky768_bp256      [E]   (encrypt -- Kyber-768 ML-KEM)
-```
-
-`ky768_bp256` = Kyber-768 (NIST security level 3) with brainpoolP256r1
-for the ECC component of the hybrid KEM.
-
-### Null ID derivation
-
-```
-fingerprint (40 hex chars)
-    |
-    v
-blake2b(digest_size=8)
-    |
-    v
-base32 encoding (lowercase, no padding)
-    |
-    v
-take first 8 chars -> format as NN-XXXX-XXXX
-```
-
-This is a one-way mapping. Given a Null ID, the GPG fingerprint cannot be
-recovered.
-
-### Encryption format
-
-`gpg --require-pqc-encryption` produces an OpenPGP message containing:
-
-- The session key encrypted with Kyber-768 (ML-KEM encapsulation)
-- The plaintext encrypted with AES256 (or the recipient's preferred cipher)
-
-The output is ASCII-armored and safe for JSON transport (after base64
-encoding within the envelope).
-
-### Double ratchet (forward secrecy)
-
-Each `PeerConnection` holds a `DoubleRatchetSession` that provides:
-
-- **Forward secrecy:** Each message uses a fresh ephemeral Kyber
-  encapsulation. Compromising the long-term key does not reveal past
-  session keys.
-- **Break-in recovery:** Future messages are safe after compromise.
-- **Replay protection:** Sequence numbers + timestamps with 5-minute
-  clock skew tolerance.
-- **Hash verification:** SHA-256 of ciphertext for integrity + dedup.
-
-Ratchet state is in-memory only. On client restart, a new X3DH handshake
-is performed.
 
 ---
 
 ## Testing
 
-### Crypto unit tests (no relay needed)
-
 ```bash
-source /tmp/nullnode-venv/bin/activate
-python -c "
-import crypto
-crypto.GPG_HOME = '/tmp/test-gpg'
-fp = crypto.generate_keypair()
-nid = crypto.null_id(fp)
-print(f'Identity: {nid}')
-"
+# Run all tests (33 tests)
+make test
+
+# Run specific package tests
+make test-crypto
+make test-p2p
+make test-dht
+make test-protocol
+
+# Fast compilation check
+make check
+
+# Clippy linter
+make lint
 ```
 
-### E2E test (P2P + DHT, two clients)
+**Test coverage:**
 
-```bash
-source /tmp/nullnode-venv/bin/activate
-
-# Terminal 1: Alice
-export NULLNODE_GNUPGHOME=/tmp/alice
-python client.py init
-python client.py export > /tmp/alice_pub.asc
-python client.py p2p --port 9001
-
-# Terminal 2: Bob
-export NULLNODE_GNUPGHOME=/tmp/bob
-python client.py init
-python client.py export > /tmp/bob_pub.asc
-python client.py import /tmp/alice_pub.asc --alias NN-ALICE-ID
-python client.py p2p --port 9002
-
-# Back to Alice:
-python client.py import /tmp/bob_pub.asc --alias NN-BOB-ID
-python client.py send NN-BOB-ID "Hello" --fingerprint BOB_FP
-```
-
-### Legacy relay E2E test
-
-```bash
-source /tmp/nullnode-venv/bin/activate
-
-# Terminal 1: relay
-python relay.py --port 18765
-
-# Terminal 2: Alice
-export NULLNODE_RELAY=ws://127.0.0.1:18765
-export NULLNODE_GNUPGHOME=/tmp/alice
-python client.py init
-python client.py export > /tmp/alice_pub.asc
-
-# Terminal 3: Bob
-export NULLNODE_RELAY=ws://127.0.0.1:18765
-export NULLNODE_GNUPGHOME=/tmp/bob
-python client.py init
-python client.py export > /tmp/bob_pub.asc
-python client.py import /tmp/alice_pub.asc --alias NN-ALICE-ID
-
-# Back to Alice:
-python client.py import /tmp/bob_pub.asc --alias NN-BOB-ID
-python client.py send NN-BOB-ID "Hello" --fingerprint BOB_FP
-```
-
----
-
-## Roadmap / extension ideas
-
-| Area | Status | What's needed |
+| Crate | Tests | Coverage |
 |---|---|---|
-| **Forward secrecy** | **Implemented** | `DoubleRatchetSession` in crypto.py |
-| **Key discovery** | Planned | WKD-style discovery: `openpgpkey.example.com/.well-known/openpgpkey/...` |
-| **Tor support** | Planned | Route P2P WebSocket through SOCKS5 (`ws://...onion...`) |
-| **TUI client** | Planned | Textual or urwid ncurses interface |
-| **Federated relays** | **Implemented** | relay.py: `remote_routes`, gossip, `relay-forward` |
-| **Clustering** | Planned | Redis backend for `message_queue` to enable horizontal relay scaling |
-| **Binary protocol** | Planned | Replace JSON with CBOR or Protocol Buffers for lower overhead |
-| **Key revocation** | Planned | `revoke` command publishing revocation certificate via relay/DHT |
-| **DHT mailbox** | **Implemented** | dht.py: `store_mailbox`, `get_mailbox` |
-| **DHT address ownership** | **Implemented** | dht.py: `dht-addr-record`, `publish_addr_record`, signature verification |
-| **TOFU pinning** | **Implemented** | dht.py: `pin_get`, `pin_update`, `pin_verify_address`, `~/.nullnode/pin_cache.json` |
-| **NAT traversal** | **Implemented** | nat.py: STUN + UDP hole punching |
-| **Proof-of-work anti-spam** | **Implemented** | protocol.py: `pow_solve`, `pow_check` |
+| `nullnode-protocol` | 9 | PoW solve/check, envelope roundtrip, GPG sign/verify |
+| `nullnode-p2p` | 2 | Transport, handshake |
+| `nullnode-dht-core` | 17 | DHT node, SQLite, ratelimit, pin_cache, bootstrap_verify |
+| `nullnode-crypto` | 11 | encrypt/decrypt, ratchet, key derivation, kyber persistence |
+| `nullnode-crypto-utils` | 4 | export/import, fingerprint validation, secure_delete |
+| `nullnode-relay` | 11 | URL parse, HMAC, route table, nonce replay, loop detection |
+| **Total** | **54** | |
+
+---
+---
+
+## ACS2.6 Compliance Status
+
+See `FEATURES.md` for full compliance matrix. Key implementation notes:
+
+| ACS2.6 Feature | Implementation Status | Notes |
+|----------------|---------------------|-------|
+| Memory Protection | ✅ Implemented | `crypto/src/secure_mem.rs` provides `secure_zero_memory`, `lock_memory`, `SecureKeyMaterial` |
+| ML-KEM Braid | ❌ Not implemented | Uses monolithic Kyber-768 key exchange (no chunking) |
+| Delivery Tokens | ❌ Not implemented | Sender identity exposed in handshake (known limitation) |
+| Hardware Attestation | ❌ Not implemented | Requires SEV-SNP/TDX platform support |
+| CBNP | ❌ Not implemented | No synthetic dummy traffic loops |
+| ML-KEM-1024 | ⚠️ Variant mismatch | Currently uses MlKem768 (NIST Level 3) vs ML-KEM-1024 (NIST Level 5) |
+
+---
+---
+
+## Building
+
+```bash
+# Build all binaries (release)
+make all
+
+# Build specific binary
+make client
+make relay
+make bootstrap
+
+# Build debug
+make debug
+
+# Install to /usr/local/bin
+sudo make install
+
+# Build static binary (requires musl target)
+make static
+
+# Generate man page
+make man
+```
+
+**Output binaries:**
+
+| Binary | Size | Description |
+|---|---|---|
+| `target/release/nullnode` | ~2 MB | CLI client |
+| `target/release/nullnode-relay` | ~2 MB | Relay server |
+| `target/release/nullnode-bootstrap` | ~4 MB | Bootstrap DHT server |
 
 ---
 
-## Contribution guidelines
+## Security considerations
 
-- Keep `crypto.py` pure -- no imports outside `hashlib`, `base64`, `json`,
-  `os`, `subprocess`, `secrets`, `hmac`, `time`, `tempfile`. GPG is the
-  only crypto provider.
-- Every new message type needs a factory method in `protocol.py`, a handler
-  branch in the appropriate handler (`relay.py`, `p2p.py`, or `dht.py`),
-  and a test.
-- Wire format changes must preserve backward compatibility for at least one
-  minor version.
-- All functions in `crypto.py` must raise `RuntimeError` on GPG failure --
-  never let a `CalledProcessError` bubble up.
-- All security-sensitive comparisons must use `hmac.compare_digest`.
-- DHT writes must include valid proof-of-work.
+1. **No automatic trust** — keys must be explicitly trusted after out-of-band verification.
+2. **Safety number verification** (G6) — deterministic safety number derived from both parties' fingerprints enables out-of-band key verification.
+3. **Constant-time comparison** — used for fingerprint comparison to prevent timing attacks.
+4. **Secure deletion** — temp files overwritten with random bytes before unlink.
+5. **TOFU pinning** — first-seen addresses and TLS certs are pinned to disk.
+6. **Rate limiting** — prevents DoS and spam on DHT and relay.
+7. **Tor support** — optional IP masking for all network traffic.
+8. **Bootstrap verification** — TLS cert domain, CA, and TOFU checks prevent rogue servers.
+9. **PoW anti-spam** — Argon2id memory-hard puzzles make bulk abuse infeasible.
+10. **Key persistence** — All persisted keys and sessions use 0o600 permissions (owner-only).
+11. **Double ratchet** — Forward secrecy with per-message key derivation; sessions now persist across restarts.
+12. **Signed P2P handshake** — All P2P hello, hello-ack, message, and ack messages are GPG-signed to prevent MITM attacks.
+13. **Signature verification** — Incoming P2P messages verify sender signature before processing.
+14. **Encrypted message storage** — SQLite database stores only ciphertext; no plaintext ever written to disk (HIGH-4).
 
 ---
 
-## Environment reference
+## Relay Federation
 
-```
-NULLNODE_RELAY          WebSocket URL (legacy relay, default ws://127.0.0.1:8765)
-NULLNODE_GNUPGHOME      GPG home directory (default ~/.nullnode/gnupg)
-NULLNODE_GPG            Path to gpg binary (default gpg)
-NULLNODE_DHT_BOOTSTRAP  Comma-separated bootstrap DHT seeds (default: 3 built-in)
-```
+Multi-relay federation allows messages to route between relay servers:
+
+1. **Peer connections** — `connect_to_peer()` maintains persistent WebSocket connections to peer relays with sender/receiver tasks
+2. **Route advertisement** — `gossip_task()` periodically advertises known null_ids to connected peers via route-advertise messages
+3. **Cross-relay forwarding** — `forward_to_peer()` sends relay-forward messages to peer relays when the recipient is not local
+4. **Route lookup** — The relay uses `FederationState::lookup_route()` to determine which peer serves a given null_id
+5. **HMAC optional auth** — Federation can use shared-secret HMAC for peer authentication (optional)
+
+**Known limitation**: Federation currently requires manual peer URL configuration via command-line.
+Automatic peer discovery will be implemented in a future phase.
+
+---
+
+## License
+
+Business Source License (BSL / BUSL).
+You can use the code for free if your company or organisation doesn't have more than 2 people.

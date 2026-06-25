@@ -1,0 +1,32 @@
+[package]
+name = "nullnode-relay"
+version.workspace = true
+edition.workspace = true
+description = "NullNode relay server (store-and-forward)"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+hmac.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+futures.workspace = true
+clap.workspace = true
+base64.workspace = true
+dirs.workspace = true
+sequoia-openpgp.workspace = true
+
+nullnode-protocol = { path = "../protocol" }
+nullnode-dht-core = { path = "../dht-core" }
+
+[[bin]]
+name = "nullnode-relay"
+path = "src/main.rs"

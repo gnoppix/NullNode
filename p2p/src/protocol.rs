@@ -1,0 +1,229 @@
+//-------------------------------------------------------------------------------
+// Name: Gnoppix Linux - Services
+// Architecture: all
+// Date: 2002-2026 by Gnoppix Linux
+// Author: Andreas Mueller
+// Website: https://www.gnoppix.com
+// Licence: Business Source License (BSL / BUSL)
+// You can use the code for free if your company or organisation doesn't have more than 2 people.
+//-------------------------------------------------------------------------------
+// P2P protocol message types and helpers.
+//-------------------------------------------------------------------------------
+
+use serde::{Deserialize, Serialize};
+
+use nullnode_protocol::constants;
+
+/// P2P hello message payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2pHello {
+    pub public_key: String,
+    pub nonce: u64,
+    pub pow_bits: u32,
+    /// Kyber-768 public key (base64 encoded, 1184 bytes raw)
+    /// Used for post-quantum key exchange
+    pub kyber_enc_key: String,
+}
+
+/// P2P hello-ack message payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2pHelloAck {
+    pub public_key: String,
+    pub nonce: u64,
+    pub pow_bits: u32,
+    /// SECURITY FIX (M6): Server-generated challenge to make PoW
+    /// unique per connection, preventing replay of the same PoW
+    /// across multiple connections.
+    pub server_challenge: String,
+    /// Kyber-768 public key (base64 encoded)
+    /// Used for post-quantum key exchange
+    pub kyber_enc_key: String,
+}
+
+/// P2P message payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2pMessage {
+    pub seq: i64,
+    pub ciphertext: String,
+    pub msg_hash: String,
+}
+
+/// P2P ack payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2pAck {
+    pub seq: i64,
+    pub msg_hash: String,
+}
+
+/// Build a p2p-hello wire envelope.
+/// SECURITY FIX (C1): Include Kyber public key for post-quantum key exchange.
+/// SECURITY FIX (C2): Sign the hello to authenticate the initiator.
+pub fn build_p2p_hello_signed(
+    public_key_b64: &str,
+    nonce: u64,
+    pow_bits: u32,
+    kyber_enc_key_b64: &str,
+    signature: &str,
+) -> nullnode_protocol::envelope::WireEnvelope {
+    let mut env = build_p2p_hello(public_key_b64, nonce, pow_bits, kyber_enc_key_b64);
+    env.sig = signature.to_string();
+    env
+}
+
+/// Build a p2p-hello wire envelope.
+/// SECURITY FIX (C1): Include Kyber public key for post-quantum key exchange.
+pub fn build_p2p_hello(
+    public_key_b64: &str,
+    nonce: u64,
+    pow_bits: u32,
+    kyber_enc_key_b64: &str,
+) -> nullnode_protocol::envelope::WireEnvelope {
+    use nullnode_protocol::envelope::WireEnvelope;
+    WireEnvelope {
+        msg_type: constants::MSG_P2P_HELLO.to_string(),
+        payload: serde_json::json!({
+            "public_key": public_key_b64,
+            "nonce": nonce,
+            "pow_bits": pow_bits,
+            "kyber_enc_key": kyber_enc_key_b64,
+        }),
+        msg_id: crate::util::uuid_hex(),
+        ts: crate::util::now_unix(),
+        sig: String::new(),
+    }
+}
+
+/// Build a p2p-hello-ack wire envelope.
+///
+/// SECURITY FIX (C3): hello-ack messages should be signed to prevent
+/// MITM injection of fake handshake completions. Use `build_p2p_hello_ack_signed`
+/// with a GPG signature in production.
+/// SECURITY FIX (M6): Includes a server_challenge to prevent PoW replay.
+/// SECURITY FIX (C1): Includes Kyber public key for post-quantum key exchange.
+pub fn build_p2p_hello_ack(
+    public_key_b64: &str,
+    nonce: u64,
+    pow_bits: u32,
+    server_challenge: &str,
+    kyber_enc_key_b64: &str,
+) -> nullnode_protocol::envelope::WireEnvelope {
+    use nullnode_protocol::envelope::WireEnvelope;
+    WireEnvelope {
+        msg_type: constants::MSG_P2P_HELLO_ACK.to_string(),
+        payload: serde_json::json!({
+            "public_key": public_key_b64,
+            "nonce": nonce,
+            "pow_bits": pow_bits,
+            "server_challenge": server_challenge,
+            "kyber_enc_key": kyber_enc_key_b64,
+        }),
+        msg_id: crate::util::uuid_hex(),
+        ts: crate::util::now_unix(),
+        sig: String::new(),
+    }
+}
+
+/// Build a signed p2p-hello-ack wire envelope.
+///
+/// SECURITY FIX (C3): The signature authenticates the responder, preventing
+/// an active MITM from injecting a fake hello-ack and hijacking the session.
+pub fn build_p2p_hello_ack_signed(
+    public_key_b64: &str,
+    nonce: u64,
+    pow_bits: u32,
+    server_challenge: &str,
+    kyber_enc_key_b64: &str,
+    signature: &str,
+) -> nullnode_protocol::envelope::WireEnvelope {
+    let mut env = build_p2p_hello_ack(public_key_b64, nonce, pow_bits, server_challenge, kyber_enc_key_b64);
+    env.sig = signature.to_string();
+    env
+}
+
+/// Build a p2p-message wire envelope.
+pub fn build_p2p_message(
+    seq: i64,
+    ciphertext_b64: &str,
+    msg_hash: &str,
+) -> nullnode_protocol::envelope::WireEnvelope {
+    use nullnode_protocol::envelope::WireEnvelope;
+    WireEnvelope {
+        msg_type: constants::MSG_P2P_MESSAGE.to_string(),
+        payload: serde_json::json!({
+            "seq": seq,
+            "ciphertext": ciphertext_b64,
+            "msg_hash": msg_hash,
+        }),
+        msg_id: crate::util::uuid_hex(),
+        ts: crate::util::now_unix(),
+        sig: String::new(),
+    }
+}
+
+/// Build a signed p2p-message wire envelope.
+///
+/// SECURITY FIX (C3): The signature authenticates the sender and protects
+/// the sequence number from MITM tampering.
+pub fn build_p2p_message_signed(
+    seq: i64,
+    ciphertext_b64: &str,
+    msg_hash: &str,
+    signature: &str,
+) -> nullnode_protocol::envelope::WireEnvelope {
+    let mut env = build_p2p_message(seq, ciphertext_b64, msg_hash);
+    env.sig = signature.to_string();
+    env
+}
+
+/// Build a p2p-ack wire envelope.
+pub fn build_p2p_ack(seq: i64, msg_hash: &str) -> nullnode_protocol::envelope::WireEnvelope {
+    use nullnode_protocol::envelope::WireEnvelope;
+    WireEnvelope {
+        msg_type: constants::MSG_P2P_ACK.to_string(),
+        payload: serde_json::json!({
+            "seq": seq,
+            "msg_hash": msg_hash,
+        }),
+        msg_id: crate::util::uuid_hex(),
+        ts: crate::util::now_unix(),
+        sig: String::new(),
+    }
+}
+
+/// Build a signed p2p-ack wire envelope.
+///
+/// SECURITY FIX (C3): The signature prevents MITM from forging acks
+/// to suppress delivery confirmations.
+pub fn build_p2p_ack_signed(
+    seq: i64,
+    msg_hash: &str,
+    signature: &str,
+) -> nullnode_protocol::envelope::WireEnvelope {
+    let mut env = build_p2p_ack(seq, msg_hash);
+    env.sig = signature.to_string();
+    env
+}
+
+/// Build a p2p-ping wire envelope.
+pub fn build_p2p_ping() -> nullnode_protocol::envelope::WireEnvelope {
+    use nullnode_protocol::envelope::WireEnvelope;
+    WireEnvelope {
+        msg_type: constants::MSG_P2P_PING.to_string(),
+        payload: serde_json::json!({}),
+        msg_id: crate::util::uuid_hex(),
+        ts: crate::util::now_unix(),
+        sig: String::new(),
+    }
+}
+
+/// Build a p2p-pong wire envelope.
+pub fn build_p2p_pong() -> nullnode_protocol::envelope::WireEnvelope {
+    use nullnode_protocol::envelope::WireEnvelope;
+    WireEnvelope {
+        msg_type: constants::MSG_P2P_PONG.to_string(),
+        payload: serde_json::json!({}),
+        msg_id: crate::util::uuid_hex(),
+        ts: crate::util::now_unix(),
+        sig: String::new(),
+    }
+}

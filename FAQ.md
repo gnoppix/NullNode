@@ -1,16 +1,16 @@
 ## How does the bootstrap server TLS work?
 
-Bootstrap servers now speak TLS directly on their listen port (no reverse
-proxy needed). Set the cert paths via environment variables:
+Bootstrap servers speak TLS directly on their listen port (no reverse
+proxy needed). The client verifies the certificate using rustls with the
+native root store (WebPKI verifier).
 
 ```bash
-export NULLNODE_BOOTSTRAP_CERT=/etc/letsencrypt/live/bootstrap-eu.gnoppix.org/fullchain.pem
-export NULLNODE_BOOTSTRAP_KEY=/etc/letsencrypt/live/bootstrap-eu.gnoppix.org/privkey.pem
-./nullnode.sh bootstrap
+# Start bootstrap with TLS (cert files provided at runtime)
+./target/release/nullnode-bootstrap --host 0.0.0.0 --port 9001
 ```
 
-Without the cert env vars, the server falls back to plain `ws://` (backward
-compatible).
+The client verifies the cert against `~/.nullnode/bootstrap_pin_cache.json`
+(TOFU) and checks domain (*.gnoppix.org / *.gnoppix.com) and CA (Let's Encrypt).
 
 ## How does the client verify the bootstrap server's identity?
 
@@ -69,46 +69,126 @@ from the first legitimate connection. Any subsequent cert change must pass
 the rotation rules (validity window + pin age), making it extremely hard
 for an attacker to substitute certs even with a valid cert for the domain.
 
-     Let me explain why STUN is used and whether it's actually needed.                                                                       
-     
-     ## why STUN exists in NullNode                                                                                                                            
-                                                                                                                                                            
-     STUN lets a client behind a NAT/router discover its public IP:port as seen from the internet. This is needed for direct P2P connections:               
-                                                                                                                                                            
-     Alice (behind NAT)              Bob (behind NAT)                                                                                                       
-       192.168.1.5:4567  ──────►  ???  (Bob can't reach Alice)                                                                                              
-                                                                                                                                                            
-     Alice asks STUN server:                                                                                                                                
-       "what address do you see me as?"                                                                                                                     
-       STUN replies: "203.0.113.42:51234"                                                                                                                   
-                                                                                                                                                            
-     Alice now knows her public endpoint.                                                                                                                   
-     She can share it in the DHT so Bob can connect.                                                                                                        
-                                                                                                                                                            
-     The flow is: STUN -> discover public endpoint -> advertise in DHT -> other peers connect via that endpoint.                                            
-     Why it's questionable                                                                                                                                  
-                                                                                                                                                            
-     1. It leaks your IP to a third-party Google server. The STUN servers in the code are all Google (stun.l.google.com, etc.). Google sees your IP,        
-     timestamp, and port. For a privacy messenger this is architecturally contradictory.                                                                    
-                                                                                                                                                            
-     2. DHT already provides peer discovery. The DHT stores null_id -> address mappings. If Bob is online, his address is already in the DHT. Alice         
-     looks him up directly. STUN is only needed to publish that address.                                                                                    
-                                                                                                                                                            
-     3. Most DHT writes happen through other peers, not directly. The Kademlia lookup finds peers who are already reachable. The STUN step is a             
-     bootstrap chicken-and-egg: you need STUN to publish your address, but you only need your address if others can't reach you.                            
-                                                                                                                                                            
-     4. It doesn't solve the harder problem. If both peers are behind symmetric NAT, STUN gives you the address but the port changes per destination.       
-     That's where TURN/ICE would be needed, which NullNode doesn't do.                                                                                      
-     What actually uses it right now                                                                                                                        
-                                                                                                                                                            
-     Looking at the code: nat.py exists but p2p.py never calls it. The P2P handshake just connects to whatever address the DHT returned. STUN is dead       
-     code in practice.                                                                                                                                      
-     Recommendation                                                                                                                                         
-                                                                                                                                                            
-     For a privacy-first messenger, STUN should be:                                                                                                         
-                                                                                                                                                            
-     - Made opt-in (not enabled by default)                                                                                                                 
-     - Replaced with user-supplied endpoints for advanced users (e.g., --public-addr wss://my-server:9001)                                                  
-     - Or removed entirely -- if you're behind NAT, you can still publish your address manually (as the DHT's advertise_address already allows) or use      
-     a public VPS as a relay                                                                                                                                
-                                
+## Why Argon2id instead of SHA-256 for PoW?
+
+SHA-256 hashcash is trivially GPU-accelerated. A single RTX 4090 can compute
+~10 billion SHA-256 hashes/second, making difficulty 16 (~65k attempts) take
+0.0065ms. A botnet of 10,000 GPUs could flood 1.5 billion DHT writes/sec.
+
+Argon2id is memory-hard: each instance requires 16MB of RAM. A 24GB GPU can
+only run ~1,500 parallel instances, each taking ~0.5s. This reduces botnet
+throughput to ~3,000 writes/sec per GPU -- a 500,000x reduction.
+
+Argon2id is also the standard for password hashing (RFC 9106) and is
+well-audited. The fallback to SHA-256 exists if the argon2 Rust crate
+is unavailable.
+
+## Why STUN exists in NullNode
+
+STUN lets a client behind a NAT/router discover its public IP:port as seen
+from the internet. This is needed for direct P2P connections:
+
+```
+Alice (behind NAT)              Bob (behind NAT)
+  192.168.1.5:4567  ──────►  ???  (Bob can't reach Alice)
+
+Alice asks STUN server:
+  "what address do you see me as?"
+  STUN replies: "203.0.113.42:51234"
+
+Alice now knows her public endpoint.
+She can share it in the DHT so Bob can connect.
+```
+
+The flow is: STUN -> discover public endpoint -> advertise in DHT -> other
+peers connect via that endpoint.
+
+**Recommendation**: For a privacy-first messenger, STUN should be opt-in
+(not enabled by default) since it leaks your IP to the STUN server.
+Alternatively, use Tor and skip STUN entirely.
+
+## How does contact verification (safety numbers) work?
+
+NullNode implements safety number verification (G6) analogous to Signal's
+safety number. When you add a contact, a deterministic "safety number" is
+computed from both parties' fingerprints:
+
+1. Both fingerprints are sorted lexicographically
+2. Concatenated with `|` separator
+3. SHA-256 hashed
+4. Formatted as 8 groups of 8 hex chars for easy visual comparison
+
+Both parties will always get the same safety number regardless of who
+initiated. If the safety numbers differ, a man-in-the-middle attack may be
+underway. Always verify safety numbers out-of-band (in-person, voice call,
+PGP signed email) before trusting a contact.
+
+## Why is Kademlia DHT routing not implemented (G4)?
+
+NullNode uses a **centralized seed model** instead of full Kademlia DHT routing.
+Bootstrap seeds act as authoritative directories -- clients query the seed to
+find peer addresses, then connect directly.
+
+**Trade-off**: The centralized seed is a single point of failure and requires
+trusted infrastructure. However, it is:
+- Simpler to implement and audit
+- More reliable (no routing table maintenance, no lookup latency)
+- Sufficient for the current scale
+
+Full Kademlia routing (K-buckets, alpha lookups, FIND_NODE/FIND_VALUE RPCs)
+is a future enhancement. The current model provides the same end-user
+experience (direct P2P messaging) with less complexity.
+
+## How does relay federation work?
+
+Multi-relay federation allows multiple relays to form a network where messages
+can be forwarded between peers. Each relay maintains:
+
+- **local_sessions**: Null IDs of directly-connected clients
+- **remote_routes**: Null IDs reachable via peer relays (learned through gossip)
+
+When a relay receives a message for a Null ID in its `remote_routes`, it wraps
+the message in a `relay-forward` envelope and sends it to the peer relay.
+The forwarding relay increments `hop_count` and appends its URL to the `via`
+chain for loop detection (max 5 hops).
+
+**Security**: Peer connections are authenticated with HMAC-SHA256
+challenge-response using a shared secret (`--secret-file`). Only relays
+knowing the shared secret can exchange routes and forward messages.
+
+**Performance**: Route advertisements are sent every 60 seconds. Routes expire
+after 30 minutes of inactivity. A background gossip task handles maintenance.
+
+## Why is I2P transport not implemented (G8)?
+
+NullNode follows a **Tor-first approach** for transport-level anonymity.
+I2P support is planned as a future transport option but requires:
+- Additional dependencies (`i2p` crate or SAM bridge integration)
+- Significant architectural changes to the transport layer
+- Separate key management (I2P destination keys vs Tor hidden service keys)
+
+The current transport layer supports:
+- Direct TCP connections
+- Tor SOCKS5 proxy (via `socks` crate)
+- Onion address validation (`.onion` TLD detection)
+
+I2P integration is deferred per the project's incremental approach: Tor first,
+I2P later.
+
+## How does key persistence work (G9, G10)?
+
+**Kyber-768 keypair persistence (G10):**
+- Keys are saved to `~/.nullnode/kyber_keys.json` as hex-encoded JSON
+- File permissions: 0o600 (owner-only read)
+- Uses `KeyExport::to_bytes()` for canonical byte representation
+- `load_or_generate()` convenience: loads if file exists, generates + saves if not
+- This ensures your DHT address (derived from your public key) stays stable
+  across restarts
+
+**Double ratchet session persistence (G9):**
+- Sessions are saved to `~/.nullnode/ratchet_sessions/` as JSON files
+- File permissions: 0o600 (owner-only read)
+- Preserves all session state: keys, sequence numbers, pending messages,
+  timestamps
+- Uses `serialize()`/`deserialize()` for JSON conversion
+- This ensures encrypted conversations survive restarts without re-keying

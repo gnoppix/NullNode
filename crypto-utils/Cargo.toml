@@ -1,0 +1,14 @@
+[package]
+name = "nullnode-crypto-utils"
+version.workspace = true
+edition.workspace = true
+description = "NullNode crypto utilities: GPG operations, secure deletion, STUN protocol"
+
+[dependencies]
+sequoia-openpgp = "2"
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+nullnode-protocol = { path = "../protocol" }
