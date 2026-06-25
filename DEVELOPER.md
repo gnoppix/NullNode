@@ -21,9 +21,13 @@ messenger/
 │   │       └── pow.rs              # Argon2id/SHA-256 PoW solve/check, tests
 │   ├── crypto/                     # Kyber-768 KEM (ALL messages), DoubleRatchetSession
 │   │   ├── Cargo.toml
-│   │   ├── src/
-│   │   │   ├── lib.rs              # encrypt/decrypt (Kyber-768 KEM), ratchet, key derivation
-│   │   │   └── kyber.rs            # Kyber-768 keypair type (re-export from ml-kem)
+│   ├── crypto/                     # ML-KEM-1024 KEM (ALL messages), DoubleRatchetSession
+│   │   │   ├── lib.rs              # encrypt/decrypt (ML-KEM KEM), ratchet, key derivation
+│   │   │   ├── kyber.rs            # ML-KEM-1024 keypair (ml-kem), MlKemVariant enum
+│   │   │   ├── secure_mem.rs       # Memory hardening (mlock, secure_zero_memory)
+│   │   │   ├── delivery_tokens.rs  # Sealed Sender delivery token derivation
+│   │   │   ├── cbnp.rs             # Covert Background Noise Protocol
+│   │   │   └── pir.rs              # PIR contact discovery with blind registries
 │   ├── crypto-utils/               # Ed25519 operations, secure deletion
 │   │   ├── Cargo.toml
 │   │   └── src/
@@ -150,9 +154,9 @@ memory-hard PoW. If Argon2id memory allocation fails, the operation fails hard.
 
 ---
 
-### `nullnode-crypto` — Kyber-768 KEM encryption, forward secrecy, and key persistence
+### `nullnode-crypto` — ML-KEM-1024 KEM encryption, forward secrecy, and key persistence
 
-**ALL user messages use Kyber-768 KEM (ML-KEM, NIST Level 3). There is NO classical fallback.**
+**ALL user messages use ML-KEM-1024 KEM (NIST Level 5) with optional ML-KEM-768 fallback. There is NO classical fallback.**
 
 ```rust
 // Encrypt plaintext for a recipient using Kyber-768 KEM (mandatory)
@@ -560,10 +564,11 @@ See `FEATURES.md` for full compliance matrix. Key implementation notes:
 |----------------|---------------------|-------|
 | Memory Protection | ✅ Implemented | `crypto/src/secure_mem.rs` provides `secure_zero_memory`, `lock_memory`, `SecureKeyMaterial` |
 | ML-KEM Braid | ❌ Not implemented | Uses monolithic Kyber-768 key exchange (no chunking) |
-| Delivery Tokens | ❌ Not implemented | Sender identity exposed in handshake (known limitation) |
+| Delivery Tokens | ✅ Complete | `delivery_tokens.rs`: HMAC-SHA256 HKDF-like derivation, 28-byte constant-size tokens, replay protection |
+| CBNP | ✅ Complete | `cbnp.rs`: Poisson-timed cover traffic, 3200-byte dummy packets, burst mode, detection |
+| PIR Contact Discovery | ✅ Complete | `pir.rs`: Blind registries with cuckoo hashing, XOR-masked bins, constant-size queries |
 | Hardware Attestation | ❌ Not implemented | Requires SEV-SNP/TDX platform support |
-| CBNP | ❌ Not implemented | No synthetic dummy traffic loops |
-| ML-KEM-1024 | ⚠️ Variant mismatch | Currently uses MlKem768 (NIST Level 3) vs ML-KEM-1024 (NIST Level 5) |
+| ML-KEM-1024 | ✅ Complete | `kyber.rs`: Uses `ml-kem 0.3.2` with MlKem1024; dual-variant via `MlKemVariant` |
 
 ---
 ---
@@ -633,6 +638,10 @@ Multi-relay federation allows messages to route between relay servers:
 
 **Known limitation**: Federation currently requires manual peer URL configuration via command-line.
 Automatic peer discovery will be implemented in a future phase.
+
+## References 
+
+1.) https://dehornoy.lmno.cnrs.fr/Surveys/Dgw.pdf
 
 ---
 

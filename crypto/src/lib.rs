@@ -35,14 +35,19 @@ use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use hkdf::Hkdf;
 use ml_kem::kem::{Decapsulate, KeyExport};
-use ml_kem::MlKem768;
+use ml_kem::MlKem1024;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use nullnode_protocol::pow::blake2b_8_hex;
 
 pub mod kyber;
+pub use kyber::MlKemVariant;
+pub use kyber::VariantKeypair;
 pub mod secure_mem;
+pub mod delivery_tokens;
+pub mod cbnp;
+pub mod pir;
 
 /// Extension trait to format a BLAKE2b-8 hex string as NN-XXXX-XXXX.
 trait FormatNnId {
@@ -81,6 +86,9 @@ pub enum CryptoError {
 
     #[error("key persistence error: {0}")]
     KeyPersistence(String),
+
+    #[error("PIR error: {0}")]
+    Pir(String),
 }
 
 impl From<serde_json::Error> for CryptoError {
@@ -195,8 +203,8 @@ pub fn encrypt(
     // Assemble: ephemeral_enc_key || kyber_ct || nonce || aes_ct
     let mut output = Vec::new();
     output.extend_from_slice(ephemeral_kp.enc.to_bytes().as_ref());
-    let kyber_ct_slice: &[u8] = kyber_ct.as_ref();
-    output.extend_from_slice(kyber_ct_slice);
+    let kyber_ct_bytes: &[u8] = kyber_ct.as_ref();
+    output.extend_from_slice(kyber_ct_bytes);
     output.extend_from_slice(&nonce);
     output.extend_from_slice(&aes_ct);
 
@@ -213,9 +221,9 @@ pub fn decrypt(
     let data = hex::decode(ciphertext_hex)
         .map_err(|e| CryptoError::DecryptFailed(format!("hex decode: {}", e)))?;
 
-    // Parse: ephemeral_enc_key (1184) || kyber_ct (1088) || nonce (12) || aes_ct
-    const EPHEM_KEY_LEN: usize = 1184;
-    const KYBER_CT_LEN: usize = 1088;
+    // Parse: ephemeral_enc_key (1568) || kyber_ct (1568) || nonce (12) || aes_ct
+    const EPHEM_KEY_LEN: usize = 1568;
+    const KYBER_CT_LEN: usize = 1568;
     const MIN_LEN: usize = EPHEM_KEY_LEN + KYBER_CT_LEN + NONCE_SIZE + 16;
 
     if data.len() < MIN_LEN {
@@ -230,8 +238,8 @@ pub fn decrypt(
     let (kyber_ct_bytes, rest) = rest.split_at(KYBER_CT_LEN);
     let (nonce_bytes, aes_ct) = rest.split_at(NONCE_SIZE);
 
-    // Parse: ephemeral_enc_key (1184) || kyber_ct (1088) || nonce (12) || aes_ct
-    let kyber_ct = ml_kem::kem::Ciphertext::<MlKem768>::try_from(kyber_ct_bytes)
+    // Parse: ephemeral_enc_key (1568) || kyber_ct (1504) || nonce (12) || aes_ct
+    let kyber_ct = ml_kem::kem::Ciphertext::<MlKem1024>::try_from(kyber_ct_bytes)
         .map_err(|e| CryptoError::DecryptFailed(format!("kyber ct parse: {:?}", e)))?;
 
     // Decapsulate shared secret using our secret key
@@ -476,9 +484,9 @@ impl DoubleRatchetSession {
         let data = hex::decode(ciphertext_hex)
             .map_err(|e| CryptoError::DecryptFailed(format!("hex decode: {}", e)))?;
 
-        // Parse: ephemeral_enc_key (1184) || kyber_ct (1088) || nonce (12) || aes_ct
-        const EPHEM_KEY_LEN: usize = 1184;
-        const KYBER_CT_LEN: usize = 1088;
+        // Parse: ephemeral_enc_key (1568) || kyber_ct (1568) || nonce (12) || aes_ct
+        const EPHEM_KEY_LEN: usize = 1568;
+        const KYBER_CT_LEN: usize = 1568;
         const MIN_LEN: usize = EPHEM_KEY_LEN + KYBER_CT_LEN + NONCE_SIZE + 16;
 
         if data.len() < MIN_LEN {
@@ -494,7 +502,7 @@ impl DoubleRatchetSession {
         let (nonce_bytes, aes_ct) = rest.split_at(NONCE_SIZE);
 
         // Reconstruct Kyber ciphertext
-        let kyber_ct = ml_kem::kem::Ciphertext::<MlKem768>::try_from(kyber_ct_bytes)
+        let kyber_ct = ml_kem::kem::Ciphertext::<MlKem1024>::try_from(kyber_ct_bytes)
             .map_err(|e| CryptoError::DecryptFailed(format!("kyber ct parse: {:?}", e)))?;
 
         // SECURITY FIX (C2): Out-of-order messages are buffered in a reorder
@@ -589,7 +597,7 @@ impl DoubleRatchetSession {
         // Check if the next expected message is in the pending buffer
         if let Some(pending) = self.pending.remove(&self.recv_seq) {
             // Reconstruct Kyber ciphertext from buffered bytes
-            let kyber_ct = ml_kem::kem::Ciphertext::<MlKem768>::try_from(&pending.kyber_ct_bytes[..])
+            let kyber_ct = ml_kem::kem::Ciphertext::<MlKem1024>::try_from(&pending.kyber_ct_bytes[..])
                 .map_err(|e| CryptoError::DecryptFailed(format!("kyber ct parse: {:?}", e)))?;
 
             let shared_secret = our_kyber_keypair.decapsulate(&kyber_ct)?;
@@ -956,7 +964,8 @@ mod tests {
     #[test]
     fn test_kyber_public_key_derivation() {
         let kp = KyberKeypair::generate().unwrap();
-        assert_eq!(kp.enc.to_bytes().len(), 1184);
+        // ML-KEM-1024: 1568 bytes public key, 64 bytes seed/dec key
+        assert_eq!(kp.enc.to_bytes().len(), 1568);
         assert_eq!(kp.dec.to_bytes().len(), 64);
     }
 }

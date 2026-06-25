@@ -16,5 +16,7 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 ml-kem = { version = "0.3.2", features = ["getrandom"] }
 libc = "0.2"
+hmac.workspace = true
+zeroize.workspace = true
 
 nullnode-protocol = { path = "../protocol" }

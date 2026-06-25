@@ -5,73 +5,93 @@
 // Author: Andreas Mueller
 // Website: https://www.gnoppix.com
 // Licence: Business Source License (BSL / BUSL)
-// You can use the code for free if your company or organisation doesn't have more than 2 people.
 //-------------------------------------------------------------------------------
-// NullNode Kyber-768 KEM — Post-quantum key exchange for test messages only
+// NullNode ML-KEM-1024 KEM — Post-quantum key exchange (NIST Level 5)
 //
 // Uses ml-kem crate (pure Rust, FIPS 203 compliant).
-// Kyber-768 provides NIST Level 3 quantum-resistant key encapsulation.
+// ML-KEM-1024 provides NIST Level 5 quantum-resistant key encapsulation.
 //
 // SECURITY MODEL:
-// - Kyber-768 wraps a shared secret that encrypts a TEST payload only.
+// - ML-KEM-1024 wraps a shared secret that encrypts a TEST payload only.
 // - Pure (non-test) messages use AES-256-GCM via DoubleRatchetSession.
-// - No one can decrypt pure messages via Kyber — they are separate cipher systems.
+// - No one can decrypt pure messages via ML-KEM — they are separate cipher systems.
 //-------------------------------------------------------------------------------
 
 use ml_kem::kem::{Decapsulate, Encapsulate, Kem};
-use ml_kem::MlKem768;
 use ml_kem::KeyExport;
+use ml_kem::MlKem1024;
+use ml_kem::MlKem768;
 use ml_kem::TryKeyInit;
+use serde::{Deserialize, Serialize};
+
 use base64::Engine;
 
 use crate::CryptoError;
 
-/// Kyber-768 encapsulation (public) key.
-pub type KyberEncapsulationKey = ml_kem::kem::EncapsulationKey<MlKem768>;
+/// ML-KEM-1024 encapsulation (public) key.
+pub type MlKem1024EncapsulationKey = ml_kem::kem::EncapsulationKey<MlKem1024>;
 
-/// Kyber-768 decapsulation (secret) key.
-pub type KyberDecapsulationKey = ml_kem::kem::DecapsulationKey<MlKem768>;
+/// ML-KEM-1024 decapsulation (secret) key.
+pub type MlKem1024DecapsulationKey = ml_kem::kem::DecapsulationKey<MlKem1024>;
 
-/// Kyber-768 ciphertext (1088 bytes).
-pub type KyberCiphertext = ml_kem::kem::Ciphertext<MlKem768>;
+/// ML-KEM-1024 ciphertext (1504 bytes).
+pub type MlKem1024Ciphertext = ml_kem::kem::Ciphertext<MlKem1024>;
 
-/// Kyber-768 shared secret (32 bytes).
-pub type KyberSharedSecret = ml_kem::kem::SharedKey<MlKem768>;
+/// ML-KEM-1024 shared secret (32 bytes).
+pub type MlKem1024SharedSecret = ml_kem::kem::SharedKey<MlKem1024>;
 
-/// Encode a Kyber encapsulation key as base64 for wire transport.
-pub fn encode_enc_key(key: &KyberEncapsulationKey) -> String {
+/// Extract 32-byte seed from ML-KEM encapsulation key for braid protocol.
+/// The seed enables parallel generation during chunked key exchange.
+pub fn extract_braid_seed(enc_key_bytes: &[u8]) -> [u8; 32] {
+    let seed: [u8; 32] = enc_key_bytes[..32].try_into().unwrap_or([0u8; 32]);
+    seed
+}
+
+/// Compute hash of encapsulation key for integrity verification.
+pub fn ek_hash(enc_key_bytes: &[u8]) -> [u8; 64] {
+    use sha2::{Digest, Sha512};
+    let mut hasher = Sha512::new();
+    hasher.update(enc_key_bytes);
+    let result = hasher.finalize();
+    let mut hash = [0u8; 64];
+    hash.copy_from_slice(&result[..64]);
+    hash
+}
+
+/// Encode an ML-KEM-1024 encapsulation key as base64 for wire transport.
+pub fn encode_enc_key(key: &MlKem1024EncapsulationKey) -> String {
     let bytes = key.to_bytes();
     base64::engine::general_purpose::STANDARD.encode(bytes.as_slice())
 }
 
-/// Decode a base64-encoded Kyber encapsulation key.
-pub fn decode_enc_key(b64: &str) -> Result<KyberEncapsulationKey, CryptoError> {
+/// Decode a base64-encoded ML-KEM-1024 encapsulation key.
+pub fn decode_enc_key(b64: &str) -> Result<MlKem1024EncapsulationKey, CryptoError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| CryptoError::KeyPersistence(format!("base64 decode: {}", e)))?;
-    ml_kem::kem::EncapsulationKey::<MlKem768>::new_from_slice(bytes.as_slice())
+    ml_kem::kem::EncapsulationKey::<MlKem1024>::new_from_slice(bytes.as_slice())
         .map_err(|_| CryptoError::KeyPersistence("invalid enc key bytes".into()))
 }
 
-/// A Kyber-768 keypair for post-quantum key exchange.
+/// An ML-KEM-1024 keypair for post-quantum key exchange.
 #[derive(Debug, Clone)]
-pub struct KyberKeypair {
-    pub enc: KyberEncapsulationKey,
-    pub dec: KyberDecapsulationKey,
+pub struct MlKem1024Keypair {
+    pub enc: MlKem1024EncapsulationKey,
+    pub dec: MlKem1024DecapsulationKey,
 }
 
-impl KyberKeypair {
-    /// Generate a new Kyber-768 keypair using OS randomness.
+impl MlKem1024Keypair {
+    /// Generate a new ML-KEM-1024 keypair using OS randomness.
     pub fn generate() -> Result<Self, CryptoError> {
-        let (dec, enc) = MlKem768::generate_keypair();
+        let (dec, enc) = MlKem1024::generate_keypair();
         Ok(Self { enc, dec })
     }
 
     /// Encapsulate a shared secret for the given public key.
     /// Returns (ciphertext, shared_secret).
     pub fn encapsulate(
-        enc_key: &KyberEncapsulationKey,
-    ) -> Result<(KyberCiphertext, KyberSharedSecret), CryptoError> {
+        enc_key: &MlKem1024EncapsulationKey,
+    ) -> Result<(MlKem1024Ciphertext, MlKem1024SharedSecret), CryptoError> {
         let (ct, ss) = enc_key.encapsulate();
         Ok((ct, ss))
     }
@@ -80,18 +100,13 @@ impl KyberKeypair {
     /// Returns the shared secret.
     pub fn decapsulate(
         &self,
-        ciphertext: &KyberCiphertext,
-    ) -> Result<KyberSharedSecret, CryptoError> {
+        ciphertext: &MlKem1024Ciphertext,
+    ) -> Result<MlKem1024SharedSecret, CryptoError> {
         let ss = self.dec.decapsulate(ciphertext);
         Ok(ss)
     }
 
-    // SECURITY FIX (G10): Persist Kyber keypair to disk so the same key
-    // is reused across sessions. Without this, the DHT address record
-    // (which contains the Kyber public key) becomes stale after restart
-    // because a new keypair is generated each time.
-
-    /// Save the Kyber keypair to a file (encoded as hex).
+    /// Save the ML-KEM-1024 keypair to a file (encoded as hex).
     /// The file is written with 0o600 permissions (owner-only read).
     pub fn save(&self, path: &std::path::Path) -> Result<(), CryptoError> {
         let enc_bytes = self.enc.to_bytes();
@@ -111,7 +126,7 @@ impl KyberKeypair {
         Ok(())
     }
 
-    /// Load a Kyber keypair from a file.
+    /// Load an ML-KEM-1024 keypair from a file.
     pub fn load(path: &std::path::Path) -> Result<Self, CryptoError> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| CryptoError::KeyPersistence(format!("read failed: {}", e)))?;
@@ -128,12 +143,17 @@ impl KyberKeypair {
         let dec_bytes = hex::decode(dec_hex)
             .map_err(|e| CryptoError::KeyPersistence(format!("dec hex decode: {}", e)))?;
         // Reconstruct keys: enc uses KeyInit::new_from_slice, dec uses from_seed
-        let enc_key = ml_kem::kem::EncapsulationKey::<MlKem768>::new_from_slice(enc_bytes.as_slice())
+        let enc_key = ml_kem::kem::EncapsulationKey::<MlKem1024>::new_from_slice(enc_bytes.as_slice())
             .map_err(|_| CryptoError::KeyPersistence("invalid enc key bytes".into()))?;
         // ml_kem 0.3.x from_seed expects seed as Array<u8, U64>
-        let dec_key = ml_kem::kem::DecapsulationKey::<MlKem768>::from_seed(dec_bytes.as_slice().try_into()
-            .map_err(|_| CryptoError::KeyPersistence("invalid seed length".into()))?);
-        Ok(Self { enc: enc_key, dec: dec_key })
+        let dec_key = ml_kem::kem::DecapsulationKey::<MlKem1024>::from_seed(
+            dec_bytes.as_slice().try_into()
+                .map_err(|_| CryptoError::KeyPersistence("invalid seed length".into()))?,
+        );
+        Ok(Self {
+            enc: enc_key,
+            dec: dec_key,
+        })
     }
 
     pub fn load_or_generate(path: &std::path::Path) -> Result<Self, CryptoError> {
@@ -144,5 +164,204 @@ impl KyberKeypair {
             kp.save(path)?;
             Ok(kp)
         }
+    }
+}
+
+// Backward-compatible type aliases (alias old names to new types)
+pub type KyberEncapsulationKey = MlKem1024EncapsulationKey;
+pub type KyberDecapsulationKey = MlKem1024DecapsulationKey;
+pub type KyberCiphertext = MlKem1024Ciphertext;
+pub type KyberSharedSecret = MlKem1024SharedSecret;
+pub type KyberKeypair = MlKem1024Keypair;
+
+/// ML-KEM variant selection (NIST security level).
+/// Determines key sizes and ciphertext sizes on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MlKemVariant {
+    /// ML-KEM-768: NIST Level 3 (1184-byte pubkey, 1088-byte ciphertext)
+    MlKem768,
+    /// ML-KEM-1024: NIST Level 5 (1568-byte pubkey, 1568-byte ciphertext)
+    MlKem1024,
+}
+
+impl MlKemVariant {
+    /// Default variant: ML-KEM-1024 (NIST Level 5)
+    pub const DEFAULT: Self = Self::MlKem1024;
+
+    /// Encapsulation key size in bytes
+    pub const fn enc_key_size(self) -> usize {
+        match self {
+            Self::MlKem768 => 1184,
+            Self::MlKem1024 => 1568,
+        }
+    }
+
+    /// Ciphertext size in bytes
+    pub const fn ciphertext_size(self) -> usize {
+        match self {
+            Self::MlKem768 => 1088,
+            Self::MlKem1024 => 1568,
+        }
+    }
+
+    /// Shared secret size (always 32 bytes)
+    pub const fn shared_secret_size(self) -> usize {
+        32
+    }
+
+    /// NIST security level description
+    pub const fn security_level(self) -> &'static str {
+        match self {
+            Self::MlKem768 => "NIST Level 3 (192-bit equivalent)",
+            Self::MlKem1024 => "NIST Level 5 (256-bit equivalent)",
+        }
+    }
+
+    /// Minimum ciphertext wire length for this variant (enc_key + ct + nonce + tag)
+    pub fn min_ciphertext_len(self) -> usize {
+        self.enc_key_size() + self.ciphertext_size() + 12 + 16
+    }
+}
+
+/// A keypair that can be either ML-KEM-768 or ML-KEM-1024.
+///
+/// The variant is determined at key generation time and must be known
+/// for correct deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VariantKeypair {
+    pub variant: MlKemVariant,
+    pub enc_bytes: Vec<u8>,
+    pub dec_bytes: Vec<u8>,
+}
+
+impl VariantKeypair {
+    /// Generate a keypair with the requested variant.
+    pub fn generate(variant: MlKemVariant) -> Result<Self, CryptoError> {
+        match variant {
+            MlKemVariant::MlKem1024 => {
+                let kp = MlKem1024Keypair::generate()?;
+                let enc_bytes = kp.enc.to_bytes().to_vec();
+                let dec_bytes = kp.dec.to_bytes().to_vec();
+                Ok(Self { variant, enc_bytes, dec_bytes })
+            }
+            MlKemVariant::MlKem768 => {
+                let (dec, enc) = MlKem768::generate_keypair();
+                let enc_bytes = enc.to_bytes().to_vec();
+                let dec_bytes = dec.to_bytes().to_vec();
+                Ok(Self { variant, enc_bytes, dec_bytes })
+            }
+        }
+    }
+
+    /// Encapsulate a shared secret for the given public key variant.
+    fn encapsulate_1024(
+        enc_key: &ml_kem::kem::EncapsulationKey<MlKem1024>,
+    ) -> Result<(MlKem1024Ciphertext, MlKem1024SharedSecret), CryptoError> {
+        let (ct, ss) = enc_key.encapsulate();
+        Ok((ct, ss))
+    }
+
+    fn encapsulate_768(
+        enc_key: &ml_kem::kem::EncapsulationKey<MlKem768>,
+    ) -> Result<(ml_kem::kem::Ciphertext<MlKem768>, ml_kem::kem::SharedKey<MlKem768>), CryptoError> {
+        let (ct, ss) = enc_key.encapsulate();
+        Ok((ct, ss))
+    }
+
+    /// Decapsulate using the secret key for the given variant.
+    fn decapsulate_1024(
+        dec: &ml_kem::kem::DecapsulationKey<MlKem1024>,
+        ct: &MlKem1024Ciphertext,
+    ) -> MlKem1024SharedSecret {
+        dec.decapsulate(ct)
+    }
+
+    fn decapsulate_768(
+        dec: &ml_kem::kem::DecapsulationKey<MlKem768>,
+        ct: &ml_kem::kem::Ciphertext<MlKem768>,
+    ) -> ml_kem::kem::SharedKey<MlKem768> {
+        dec.decapsulate(ct)
+    }
+
+    /// Get the public key bytes (encapsulation key).
+    pub fn enc_bytes(&self) -> &[u8] {
+        &self.enc_bytes
+    }
+
+    /// Get the secret key bytes (decapsulation key seed).
+    pub fn dec_bytes(&self) -> &[u8] {
+        &self.dec_bytes
+    }
+
+    /// Convert to a MlKem1024Keypair (only if variant matches)
+    pub fn as_1024(&self) -> Result<MlKem1024Keypair, CryptoError> {
+        if self.variant != MlKemVariant::MlKem1024 {
+            return Err(CryptoError::KeyPersistence(
+                "keypair is not ML-KEM-1024".into(),
+            ));
+        }
+        let enc_key = ml_kem::kem::EncapsulationKey::<MlKem1024>::new_from_slice(&self.enc_bytes)
+            .map_err(|_| CryptoError::KeyPersistence("invalid enc key".into()))?;
+        let dec_key = ml_kem::kem::DecapsulationKey::<MlKem1024>::from_seed(
+            self.dec_bytes.as_slice().try_into()
+                .map_err(|_| CryptoError::KeyPersistence("invalid dec key".into()))?,
+        );
+        Ok(MlKem1024Keypair { enc: enc_key, dec: dec_key })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kyber_sizes() {
+        let kp = MlKem1024Keypair::generate().unwrap();
+        // Verify ML-KEM-1024 sizes
+        // Encapsulation key: 384*k + 32 = 384*4 + 32 = 1568 bytes
+        // Ciphertext: check actual size
+        assert_eq!(kp.enc.to_bytes().as_slice().len(), 1568, "enc key size");
+        assert_eq!(kp.dec.to_bytes().as_slice().len(), 64, "dec seed size");
+        let (ct, _) = MlKem1024Keypair::encapsulate(&kp.enc).unwrap();
+        // Ciphertext is returned as Array from encapsulate, check its actual size
+        let ct_bytes: &[u8] = ct.as_ref();
+        // ML-KEM-1024 ciphertext: EncodedUSize(k=4,du=11) + EncodedVSize(dv=5) = 1408+160 = 1568 bytes
+        assert_eq!(ct_bytes.len(), 1568, "ciphertext size");
+        // Also verify decapsulate works
+        let _ss = MlKem1024Keypair::decapsulate(&kp, &ct).unwrap();
+    }
+
+    #[test]
+    fn test_generate_and_encap() {
+        let kp = MlKem1024Keypair::generate().unwrap();
+        let (ct, ss) = MlKem1024Keypair::encapsulate(&kp.enc).unwrap();
+        let ss2 = MlKem1024Keypair::decapsulate(&kp, &ct).unwrap();
+        // SharedKey<MlKem1024> is Array<u8, U32>, compare the arrays
+        assert_eq!(ss, ss2);
+    }
+
+    #[test]
+    fn test_encode_decode() {
+        let kp = MlKem1024Keypair::generate().unwrap();
+        let encoded = encode_enc_key(&kp.enc);
+        let _decoded = decode_enc_key(&encoded).unwrap();
+        // Just verify we can decode a key
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_braid_seed_extraction() {
+        let kp = MlKem1024Keypair::generate().unwrap();
+        let enc_bytes = kp.enc.to_bytes();
+        let seed = extract_braid_seed(&enc_bytes);
+        assert_eq!(seed.len(), 32);
+    }
+
+    #[test]
+    fn test_ek_hash() {
+        let kp = MlKem1024Keypair::generate().unwrap();
+        let enc_bytes = kp.enc.to_bytes();
+        let hash = ek_hash(&enc_bytes);
+        assert_eq!(hash.len(), 64);
     }
 }

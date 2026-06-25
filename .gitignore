@@ -1,4 +1,5 @@
 /target/                                                                                                             
+/documentation/
 *.db                                                                                                                 
 nullnode_keys/                                                                                                       
 nullnode_ratchet_sessions/  

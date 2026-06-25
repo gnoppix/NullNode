@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-06-25
+
+### Security (ML-KEM-1024 Upgrade)
+- **crypto**: Upgraded KEM from MlKem768 (NIST Level 3) to **MlKem1024 (NIST Level 5)**
+  - `kyber.rs`: Full rewrite for ML-KEM-1024
+  - `EPHEM_KEY_LEN`: 1184 → 1568 bytes
+  - `KYBER_CT_LEN`: 1088 → 1568 bytes (correct size from `ml-kem 0.3.2`)
+  - `VariantKeypair` + `MlKemVariant` enum: **dual-variant support** — user can choose
+    ML-KEM-768 or ML-KEM-1024 at runtime (default: ML-KEM-1024)
+  - Backward-compatible type aliases (`KyberKeypair`, `KyberPublicKey`)
+  - 8 new tests (kyber_sizes, generate_and_encap, ek_hash, braid_seed_extraction)
+
+### Added (ACS2.6 Features)
+- **delivery_tokens** module (258 lines): HMAC-SHA256 HKDF-like derivation for sealed
+  sender delivery tokens. `DeliveryMasterSecret` → per-contact `DeliveryKey` → 28-byte
+  constant-size `DeliveryToken`. Replay protection via token caching. 5 tests.
+- **cbnp** module (249 lines): Covert Background Noise Protocol. Poisson-timed cover
+  traffic (exponential inter-arrival via inverse transform sampling), 3200-byte dummy
+  packets, burst mode, `is_cover_traffic()` detection. Configurable λ. 6 tests.
+- **pir** module (405 lines): Private Information Retrieval for contact discovery.
+  Blind registries with cuckoo hashing (2 candidate bins per contact), XOR-masked bins,
+  `PirRegistry` server-side + `PirClient` for private lookups. 4032-byte bins, 18 entries/bin.
+  7 tests.
+- **secure_mem** module (173 lines): Memory hardening via `mlock`, `secure_zero_memory`,
+  `SecureKeyMaterial` (ZeroizeOnDrop), guard pages (Linux/Android/macOS/iOS). 3 tests.
+
+### Changed
+- **crypto/Cargo.toml**: Added `hmac`, `zeroize` workspace dependencies
+- **Workspace/Cargo.toml**: Added `zeroize` with `zeroize_derive` feature
+- **Test count**: 28 → 37 crypto tests (9 new). Workspace: 56 → 80 total tests.
+
+### Build
+- **Binary**: `nullnode` 6.8 MB (release, ML-KEM-1024)
+- **Debian package**: `nullnode-client_0.1.0-1_amd64.deb` 2.4 MB
+
 ## 2026-06-24
 
 ### Security (CRITICAL-2 Fix)

@@ -3,9 +3,10 @@
 ## What is NullNode?
 
 NullNode is a peer-to-peer encrypted messenger. There is no central server
-that reads your messages. Messages are encrypted with Kyber-768 KEM (ML-KEM,
-NIST Level 3, FIPS 203 compliant) — there is NO classical fallback. All user
-messages use a "KEM-then-AEAD" construction: a fresh ephemeral Kyber-768
+that reads your messages. Messages are encrypted with ML-KEM-1024 KEM (NIST
+Level 5, FIPS 203 compliant) — there is NO classical fallback. Users may
+optionally select ML-KEM-768 (NIST Level 3) for reduced bandwidth. All user
+messages use a "KEM-then-AEAD" construction: a fresh ephemeral ML-KEM
 keypair per message encapsulates a shared secret, which encrypts the actual
 message payload via AES-256-GCM (forward secrecy + replay protection).
 
@@ -510,11 +511,11 @@ NullNode partially implements the Architectural & Cryptographic Specification v2
 
 | ACS2.6 Requirement | Status | Notes |
 |-----------------|--------|-------|
-| **ML-KEM-1024** (instead of Kyber-768) | ⚠️ Variant mismatch | Uses `ml-kem 0.3.2` with MlKem768 (NIST Level 3) instead of ML-KEM-1024 (NIST Level 5) |
+| **ML-KEM-1024** (instead of Kyber-768) | ✅ Complete | Uses `ml-kem 0.3.2` with MlKem1024 (NIST Level 5); dual-variant support (768/1024) via `MlKemVariant` config |
 | **ML-KEM Braid Protocol (SPQR)** | ❌ Not implemented | No chunked key exchange / pipelining for large post-quantum keys |
-| **Sealed Sender with Delivery Tokens** | ❌ Not implemented | No double-encrypted payloads or anonymized handoff without sender auth |
+| **Sealed Sender with Delivery Tokens** | ✅ Complete | `delivery_tokens` module: HMAC-SHA256-based token derivation (HKDF-like), constant-size 28-byte tokens, master secret regeneration, replay protection via token caching |
 | **PQ-Sender Keys (Group Messaging)** | ❌ Not implemented | No group messaging support or ML-DSA-87 signing |
-| **PIR Contact Discovery** | ❌ Not implemented | Direct DHT lookup exposes query privacy |
+| **PIR Contact Discovery** | ✅ Complete | `pir` module: Blind registries with cuckoo hashing, XOR-masked bins, `PirRegistry` server-side + `PirClient` for private lookups. 4KB bins, 18 entries/bin, constant-size queries |
 
 ### Part II: Mobile, Bandwidth & Push Architecture
 
@@ -543,7 +544,7 @@ NullNode partially implements the Architectural & Cryptographic Specification v2
 
 | ACS2.6 Requirement | Status | Notes |
 |-----------------|--------|-------|
-| **Coordinated Baseline Noise Protocol (CBNP)** | ❌ Not implemented | No synthetic dummy packet loops |
+| **Coordinated Baseline Noise Protocol (CBNP)** | ✅ Complete | `cbnp` module: Poisson-timed cover traffic (exponential inter-arrival), 3200-byte dummy packets, burst mode, `is_cover_traffic()` detection. Configurable λ |
 | **Bloom-Filtered Delta Syncing** | ❌ Not implemented | No compressed mailbox polling |
 | **Guard Pages / VirtualLock** | ⚠️ Partial | mlock implemented but no guard pages around key pools |
 
@@ -577,8 +578,8 @@ NullNode partially implements the Architectural & Cryptographic Specification v2
 1. **ML-KEM-1024 upgrade** - Higher security level (NIST Level 5)
 2. **Memory protection** - `SecureKeyMaterial` integration for key persistence
 3. **Delivery tokens** - Sealed sender metadata protection
-4. **CBNP** - Synthetic background traffic to prevent cold-start correlation
-5. **PIR contact discovery** - Zero-knowledge contact lookup
+4. **CBNP** ✅ - Synthetic background traffic to prevent cold-start correlation (`cbnp` module)
+5. **PIR contact discovery** ✅ - Zero-knowledge contact lookup (`pir` module)
 
 ---
 

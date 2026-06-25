@@ -11,3 +11,4 @@ pub mod constants;
 pub mod envelope;
 pub mod gpg;
 pub mod pow;
+pub mod braid;
