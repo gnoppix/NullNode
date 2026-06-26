@@ -2,7 +2,8 @@
 
 **Post Quantum Encryption, decentalized modern messaging that needs no phone, no email, and no personal information, no company in between.**
 
-Think of it like sending secret notes directly to your friend's house — but the mailman, the post office, and even the government can't read them. NullNode is a messenger that connects you directly to the people you talk to. No company sits in the middle seeing your messages.
+Think of it like handing a secret note directly to your friend, where the mailman, the post office, and the government are entirely locked out. NullNode is a peer-to-peer messenger that connects you directly to your contacts without any company sitting in the middle. No one can see who you are messaging, sharing files with, or calling. Your metadata is completely hidden. It isn't just the initial handshake that is post-quantum encrypted—everything is. If an adversary monitors your connection, they will only see the amount of data being transferred and nothing more. For deeper technical details, refer to the developer documentation.
+
 
 Every message is protected by the strongest encryption available today (ML-KEM-1024, the US government's post-quantum standard). Even if someone records everything now and builds a supercomputer in 20 years, they still can't decrypt it.
 
