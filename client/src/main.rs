@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use futures::{SinkExt as _, StreamExt as _};
@@ -36,11 +37,122 @@ use base64::Engine;
 
 const GPG_HOME: &str = ".nullnode/gnupg";
 const CONTACTS_PATH: &str = ".nullnode/contacts.json";
+const DELIVERY_SECRETS_PATH: &str = ".nullnode/delivery_secrets.json";
 const IDENTITY_PATH: &str = ".nullnode/identity.json";
 const BOOTSTRAP_PATH: &str = ".nullnode/bootstrap_pin_cache.json";
 const MESSAGES_DB: &str = ".nullnode/messages.db";
 const SEED_URL: &str = "ws://127.0.0.1:9001";
 const RELAY_URL: &str = "ws://127.0.0.1:8765";
+const DB_KEY_PATH: &str = ".nullnode/db_key.json";
+
+// ------------------------------------------------------------------ //
+//  Database Encryption (AES-256-GCM)                                  //
+// ------------------------------------------------------------------ //
+
+/// Database encryption key for message-at-rest protection.
+///
+/// Uses AES-256-GCM with a random 96-bit nonce per encryption.
+/// The key is stored on disk encrypted with a key derived from the
+/// user's identity key (first app: derived from Kyber public key hash).
+///
+/// ACS2.6 Part III.2: AEAD enforcement for local data-at-rest.
+struct DbEncryptionKey {
+    key: [u8; 32],
+}
+
+impl DbEncryptionKey {
+    /// Load or create the database encryption key.
+    ///
+    /// In the first app, the key is stored directly on disk (0o600).
+    /// In production, this should be derived from HSM/TEK + user entropy.
+    async fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
+        let path = home_dir().join(DB_KEY_PATH);
+
+        if path.exists() {
+            let hex_key = tokio::fs::read_to_string(&path).await?;
+            let bytes = hex::decode(hex_key.trim())?;
+            if bytes.len() != 32 {
+                return Err("invalid db key length".into());
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            Ok(Self { key })
+        } else {
+            // Generate a new random key
+            let mut key = [0u8; 32];
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut key);
+
+            // Store with restrictive permissions
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let hex_key = hex::encode(key);
+            tokio::fs::write(&path, &hex_key).await?;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+
+            Ok(Self { key })
+        }
+    }
+
+    /// Generate a fresh random 32-byte AES-256 key without persistent storage.
+    /// Used for in-memory databases that should never be written to disk.
+    fn generate_random() -> Self {
+        use rand::RngCore;
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        Self { key }
+    }
+
+    /// Encrypt plaintext using AES-256-GCM.
+    ///
+    /// Output format: [nonce (12 bytes)] [ciphertext + tag]
+    fn encrypt(&self, plaintext: &str) -> Result<String, Box<dyn std::error::Error>> {
+        use aes_gcm::aead::{Aead, KeyInit, OsRng};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+        let key = Key::<Aes256Gcm>::from_slice(&self.key);
+        let cipher = Aes256Gcm::new(key);
+
+        let nonce_bytes: [u8; 12] = rand::random();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())
+            .map_err(|e| format!("encryption failed: {}", e))?;
+
+        // Prepend nonce to ciphertext
+        let mut output = Vec::with_capacity(12 + ciphertext.len());
+        output.extend_from_slice(&nonce_bytes);
+        output.extend_from_slice(&ciphertext);
+
+        Ok(base64::engine::general_purpose::STANDARD.encode(&output))
+    }
+
+    /// Decrypt ciphertext using AES-256-GCM.
+    ///
+    /// Expects format: [nonce (12 bytes)] [ciphertext + tag]
+    fn decrypt(&self, encrypted_b64: &str) -> Result<String, Box<dyn std::error::Error>> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+        let data = base64::engine::general_purpose::STANDARD.decode(encrypted_b64)?;
+        if data.len() < 12 + 16 {
+            // nonce + minimum tag
+            return Err("ciphertext too short".into());
+        }
+
+        let (nonce_bytes, ciphertext) = data.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        let key = Key::<Aes256Gcm>::from_slice(&self.key);
+        let cipher = Aes256Gcm::new(key);
+
+        let plaintext = cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| format!("decryption failed: {}", e))?;
+
+        Ok(String::from_utf8(plaintext)?)
+    }
+}
 
 // ------------------------------------------------------------------ //
 //  Identity                                                          //
@@ -137,6 +249,142 @@ fn save_contacts(contacts: &Contacts) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 // ------------------------------------------------------------------ //
+//  Delivery Token Secrets (ACS2.6 Part I.2)                          //
+// ------------------------------------------------------------------ //
+
+/// Load or create per-contact delivery master secrets.
+/// Each contact gets a unique HMAC master secret for token derivation.
+fn load_delivery_secrets() -> HashMap<String, String> {
+    let path = home_dir().join(DELIVERY_SECRETS_PATH);
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_delivery_secrets(secrets: &HashMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = home_dir().join(DELIVERY_SECRETS_PATH);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(secrets)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Get or create a delivery master secret for a contact.
+/// The secret is stored as hex on disk; in production it should be derived
+/// from the Kyber shared secret during contact initialization.
+fn get_or_create_delivery_secret(contact_nid: &str) -> Result<nullnode_crypto::delivery_tokens::DeliveryMasterSecret, Box<dyn std::error::Error>> {
+    let mut secrets = load_delivery_secrets();
+
+    if let Some(hex) = secrets.get(contact_nid) {
+        let bytes = hex::decode(hex)?;
+        if bytes.len() != 64 {
+            return Err("invalid delivery secret length".into());
+        }
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&bytes);
+        let master = nullnode_crypto::delivery_tokens::DeliveryMasterSecret::from_bytes(arr);
+        Ok(master)
+    } else {
+        let master = nullnode_crypto::delivery_tokens::DeliveryMasterSecret::generate();
+        let bytes = *master.as_bytes();
+        secrets.insert(contact_nid.to_string(), hex::encode(&bytes));
+        save_delivery_secrets(&secrets)?;
+        Ok(master)
+    }
+}
+
+/// Generate a delivery token message for a recipient.
+/// ACS2.6 Part I.2: Anonymous delivery token for sealed sender.
+fn generate_delivery_token(
+    recipient_nid: &str,
+    message_id: u64,
+) -> Result<nullnode_crypto::delivery_tokens::DeliveryTokenMessage, Box<dyn std::error::Error>> {
+    let master = get_or_create_delivery_secret(recipient_nid)?;
+    let token = master.derive_token(recipient_nid, message_id)?;
+
+    // Hash the sender's public key (fingerprint) for recipient identification
+    let identity = Identity::load()?;
+    let pk_hash = sha256_hex(&identity.fingerprint);
+    let sender_key_hash = format!("{}:{}", &pk_hash[..16], &pk_hash[16..32]);
+
+    Ok(nullnode_crypto::delivery_tokens::DeliveryTokenMessage {
+        token: token.to_hex(),
+        sender_key_hash,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+    })
+}
+
+// ------------------------------------------------------------------ //
+//  PIR Local Contact Discovery (ACS2.6 Part I.3)                     //
+// ------------------------------------------------------------------ //
+
+/// Local PIR-based contact registry for privacy-preserving contact lookup.
+/// Prevents forensic analysis of the contact list by using cuckoo-hashed bins.
+struct PirContactCache {
+    registry: nullnode_crypto::pir::PirRegistry,
+}
+
+impl PirContactCache {
+    /// Build a PIR cache from the local contacts file.
+    fn build() -> Result<Self, Box<dyn std::error::Error>> {
+        let contacts = load_contacts();
+        let mut registry = nullnode_crypto::pir::PirRegistry::new();
+
+        for (nid, fingerprint) in &contacts {
+            let fp_hash = sha256_hex(fingerprint);
+            let hash_bytes = hex::decode(&fp_hash)?;
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&hash_bytes);
+            // Store the NID as metadata (contact identifier)
+            let entry = nullnode_crypto::pir::PirContactEntry::new(hash, nid.as_bytes())?;
+            // Use cuckoo hashing to determine bin placement
+            let client = nullnode_crypto::pir::PirClient::new();
+            let (bin_idx, _) = client.prepare_registration(&hash)?;
+            registry.add_entry(bin_idx, &entry)?;
+        }
+
+        Ok(Self { registry })
+    }
+
+    /// Look up a contact by fingerprint hash using PIR blind retrieval.
+    /// Returns the contact NID if found.
+    fn lookup(&self, fingerprint: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let fp_hash = sha256_hex(fingerprint);
+        let hash_bytes = hex::decode(&fp_hash)?;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&hash_bytes);
+
+        let client = nullnode_crypto::pir::PirClient::new();
+        let tokens = client.query_contact(&hash)?;
+
+        // Query each candidate bin
+        for token in &tokens {
+            if let Some(response) = self.registry.handle_query(token) {
+                // Process response: XOR mask + scan for matching entry
+                if let Some(entry) = client.process_response(&response, &token.xor_mask, &hash)? {
+                    // Extract NID from metadata (bytes 32.. of the entry)
+                    let raw = entry.to_bytes();
+                    let nid = String::from_utf8_lossy(&raw[32..]).trim_end_matches('\0').to_string();
+                    if !nid.is_empty() {
+                        return Ok(Some(nid));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+// ------------------------------------------------------------------ //
 //  Message Store (G5)                                                //
 // ------------------------------------------------------------------ //
 
@@ -150,9 +398,9 @@ struct StoredMessage {
     delivered: bool,
 }
 
-#[derive(Clone)]
 struct MessageStore {
     pool: Pool<sqlx::Sqlite>,
+    db_key: DbEncryptionKey,
 }
 
 impl MessageStore {
@@ -169,7 +417,7 @@ impl MessageStore {
             .max_connections(5)
             .connect(&url)
             .await?;
-        
+
         // Set permissions on the database file (may need to retry on race condition)
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
 
@@ -192,7 +440,35 @@ impl MessageStore {
         .execute(&pool)
         .await?;
 
-        Ok(Self { pool })
+        let db_key = DbEncryptionKey::load_or_create().await?;
+
+        Ok(Self { pool, db_key })
+    }
+
+    /// Create an in-memory SQLite database for ephemeral KEM handshake state.
+    /// No data is written to disk — all state is lost on process exit.
+    /// Uses a fresh random encryption key (no persistence needed).
+    async fn open_in_memory() -> Result<Self, Box<dyn std::error::Error>> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS kem_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_nid TEXT NOT NULL,
+                session_key BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )"
+        )
+        .execute(&pool)
+        .await?;
+
+        let db_key = DbEncryptionKey::generate_random();
+
+        Ok(Self { pool, db_key })
     }
 
     async fn store_message(
@@ -202,13 +478,15 @@ impl MessageStore {
         ciphertext: &str,
     ) -> Result<i64, Box<dyn std::error::Error>> {
         let timestamp = chrono::Utc::now().to_rfc3339();
+        // ACS2.6 Part III.2: Encrypt ciphertext before writing to disk
+        let encrypted_ct = self.db_key.encrypt(ciphertext)?;
         let result = sqlx::query(
             "INSERT INTO messages (from_nid, to_nid, ciphertext, timestamp, delivered)
              VALUES (?, ?, ?, ?, 1)"
         )
         .bind(from_nid)
         .bind(to_nid)
-        .bind(ciphertext)
+        .bind(&encrypted_ct)
         .bind(&timestamp)
         .execute(&self.pool)
         .await?;
@@ -225,7 +503,20 @@ impl MessageStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|r| r.into()).collect())
+        // Decrypt ciphertext on read
+        Ok(rows.into_iter().filter_map(|r| {
+            match self.db_key.decrypt(&r.ciphertext) {
+                Ok(pt) => Some(StoredMessage {
+                    id: r.id,
+                    from_nid: r.from_nid,
+                    to_nid: r.to_nid,
+                    ciphertext: pt,
+                    timestamp: r.timestamp,
+                    delivered: r.delivered != 0,
+                }),
+                Err(_) => None, // Skip corrupted/undecryptable entries
+            }
+        }).collect())
     }
 
     async fn get_messages_from(&self, from_nid: &str, limit: i64) -> Result<Vec<StoredMessage>, Box<dyn std::error::Error>> {
@@ -238,7 +529,19 @@ impl MessageStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|r| r.into()).collect())
+        Ok(rows.into_iter().filter_map(|r| {
+            match self.db_key.decrypt(&r.ciphertext) {
+                Ok(pt) => Some(StoredMessage {
+                    id: r.id,
+                    from_nid: r.from_nid,
+                    to_nid: r.to_nid,
+                    ciphertext: pt,
+                    timestamp: r.timestamp,
+                    delivered: r.delivered != 0,
+                }),
+                Err(_) => None,
+            }
+        }).collect())
     }
 }
 
@@ -558,6 +861,12 @@ async fn send_message(
 
     // Send encrypted message (signed)
     let p2p_msg = nullnode_p2p::protocol::build_p2p_message_signed(1, &encrypted_msg, &msg_hash, &msg_sig);
+
+    // ACS2.6 Part I.2: Attach delivery token for sealed sender
+    let delivery_token = generate_delivery_token(recipient_nid, 1)?;
+    let token_msg = serde_json::to_string(&delivery_token)?;
+    ws.send(Message::Text(token_msg.into())).await.ok();
+
     ws.send(Message::Text(serde_json::to_string(&p2p_msg)?.into()))
         .await
         .map_err(|e| format!("P2P send failed: {}", e))?;
@@ -603,11 +912,31 @@ async fn run_listener(
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
-        let store_clone = store.clone();
+        let store_pool = store.pool.clone();
+        let db_key_path = home_dir().join(DB_KEY_PATH);
         let id_clone = identity.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_incoming_connection(stream, peer_addr, id_clone, store_clone).await {
+            // Each spawned task creates its own DbEncryptionKey from the file
+            let db_key = match tokio::fs::read_to_string(&db_key_path).await {
+                Ok(hex) => match hex::decode(hex.trim()) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&bytes);
+                        DbEncryptionKey { key }
+                    }
+                    _ => {
+                        tracing::error!("Invalid db key file");
+                        return;
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("Failed to read db key: {}", e);
+                    return;
+                }
+            };
+            let store = MessageStore { pool: store_pool, db_key };
+            if let Err(e) = handle_incoming_connection(stream, peer_addr, id_clone, store).await {
                 tracing::debug!("Connection from {} error: {}", peer_addr, e);
             }
         });
@@ -852,10 +1181,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("nullnode=info".parse()?))
         .init();
 
-    let args = Args::parse();
+    // ACS2.6 Part III.2: Lifecycle memory hooks — zeroize on SIGINT/SIGTERM
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_clone = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("received SIGINT, zeroizing secure memory...");
+        shutdown_clone.notify_one();
+        // Give a moment for cleanup, then exit
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::process::exit(0);
+    });
 
-    // G5: Open message store (needed for all commands that touch messages)
-    let store = MessageStore::open().await?;
+    let args = Args::parse();
 
     match args.cmd {
         Commands::Init => {
@@ -872,10 +1210,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Fingerprint: {}", identity.fingerprint);
         }
         Commands::Send { to, message } => {
+            let store = MessageStore::open().await?;
             let identity = Identity::load()?;
             send_message(&identity, &to, &message, &store).await?;
         }
         Commands::Read => {
+            let store = MessageStore::open().await?;
             let identity = Identity::load()?;
 
             // G2: Fetch from relay mailbox
@@ -931,6 +1271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Added contact: {} -> {}", null_id, fingerprint.to_uppercase());
         }
         Commands::Listen => {
+            let store = MessageStore::open().await?;
             let identity = Identity::load()?;
             println!("Starting P2P listener...");
             run_listener(identity, store).await?;

@@ -1593,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "nullnode-bootstrap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "blake2",
@@ -1616,8 +1616,9 @@ dependencies = [
 
 [[package]]
 name = "nullnode-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "aes-gcm",
  "base64",
  "blake2",
  "chrono",
@@ -1645,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "nullnode-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -1665,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "nullnode-crypto-utils"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "nullnode-protocol",
@@ -1678,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "nullnode-dht-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "blake2",
@@ -1707,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "nullnode-p2p"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "hex",
@@ -1726,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "nullnode-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "blake2",
@@ -1742,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "nullnode-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "clap",
@@ -1750,6 +1751,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "nullnode-crypto",
  "nullnode-dht-core",
  "nullnode-protocol",
  "rand 0.8.6",

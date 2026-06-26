@@ -26,6 +26,7 @@ sequoia-openpgp.workspace = true
 
 nullnode-protocol = { path = "../protocol" }
 nullnode-dht-core = { path = "../dht-core" }
+nullnode-crypto = { path = "../crypto" }
 
 [[bin]]
 name = "nullnode-relay"

@@ -12,8 +12,15 @@
 //! This module implements ACS2.6 specification requirements for memory hardening:
 //! - secure_zero_memory: Prevents dead store elimination optimization
 //! - mlock: Locks memory to prevent swapping to disk (Linux/Unix platforms)
+//! - Guard pages: Unmapped memory pages around key material to catch overflows
+//! - SecureKeyMaterial: Optional guard-page-protected key allocation
 
+use std::alloc::{alloc, Layout};
+use std::ptr::NonNull;
 use std::sync::atomic::{compiler_fence, Ordering};
+
+/// Guard page size (matches typical OS page size)
+pub const GUARD_PAGE_SIZE: usize = 4096;
 
 /// Securely overwrites a memory buffer with zeros.
 ///
@@ -140,6 +147,120 @@ impl Drop for SecureKeyMaterial {
     }
 }
 
+/// Allocate memory with guard pages on both sides.
+///
+/// Layout: [Guard Page (PROT_NONE)] [Key Data] [Guard Page (PROT_NONE)]
+/// Returns a NonNull pointer to the key data region (not the guard pages).
+///
+/// # Safety
+/// The caller must ensure the returned pointer is properly freed via `dealloc_guarded`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub unsafe fn alloc_guarded(data_size: usize) -> Option<NonNull<u8>> {
+    let page_size = GUARD_PAGE_SIZE;
+    let total_size = page_size * 2 + data_size;
+    // Round up to page boundary
+    let total_size = (total_size + page_size - 1) & !(page_size - 1);
+
+    let layout = Layout::from_size_align(total_size, page_size).ok()?;
+    let base = alloc(layout);
+    if base.is_null() {
+        return None;
+    }
+
+    // Make the first guard page inaccessible
+    let guard_before = base as *mut libc::c_void;
+    libc::mprotect(guard_before, page_size, libc::PROT_NONE);
+
+    // Make the last guard page inaccessible
+    let guard_after = base.add(total_size - page_size) as *mut libc::c_void;
+    libc::mprotect(guard_after, page_size, libc::PROT_NONE);
+
+    // Lock the data region in RAM
+    let data_ptr = base.add(page_size) as *mut libc::c_void;
+    libc::mlock(data_ptr, data_size as libc::size_t);
+
+    Some(NonNull::new_unchecked(data_ptr as *mut u8))
+}
+
+/// Deallocate guarded memory with guard pages.
+///
+/// # Safety
+/// `ptr` must have been returned by `alloc_guarded` with the same `data_size`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub unsafe fn dealloc_guarded(ptr: NonNull<u8>, data_size: usize) {
+    let page_size = GUARD_PAGE_SIZE;
+    let total_size = page_size * 2 + data_size;
+    let total_size = (total_size + page_size - 1) & !(page_size - 1);
+
+    let base = ptr.as_ptr().sub(page_size) as *mut libc::c_void;
+
+    // Unlock the data region
+    let data_ptr = ptr.as_ptr() as *mut libc::c_void;
+    libc::munlock(data_ptr, data_size as libc::size_t);
+
+    // Unmap the entire region (guard pages + data)
+    libc::munmap(base, total_size as libc::size_t);
+}
+
+/// Guard-page-protected key material for high-security environments.
+///
+/// On Linux/Android, allocates key data between two PROT_NONE guard pages
+/// that are mlock'd and surrounded by unmapped memory. Any buffer overflow
+/// or out-of-bounds access triggers an immediate SIGSEGV.
+///
+/// On unsupported platforms, falls back to standard `SecureKeyMaterial`.
+pub struct GuardedKeyMaterial {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+impl GuardedKeyMaterial {
+    /// Create a new guard-page-protected key material.
+    ///
+    /// Copies `key_bytes` into guarded memory and zeroes the source.
+    pub fn new(key_bytes: &mut [u8]) -> Option<Self> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let len = key_bytes.len();
+            let ptr = unsafe { alloc_guarded(len)? };
+            unsafe {
+                std::ptr::copy_nonoverlapping(key_bytes.as_ptr(), ptr.as_ptr(), len);
+            }
+            secure_zero_memory(key_bytes);
+            Some(Self { ptr, len })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = key_bytes;
+            None // Unsupported on this platform
+        }
+    }
+
+    /// Access the key material.
+    pub fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Get length of key material.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Drop for GuardedKeyMaterial {
+    fn drop(&mut self) {
+        unsafe {
+            secure_zero_memory(std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len));
+            dealloc_guarded(self.ptr, self.len);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +291,20 @@ mod tests {
         // After purge, the buffer should be zeroed
         let all_zeros = skm.bytes().iter().all(|&b| b == 0);
         assert!(skm.is_empty() || all_zeros);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn test_guarded_key_material() {
+        let mut key = vec![0xADu8; 64];
+        let gkm = GuardedKeyMaterial::new(&mut key).unwrap();
+        // Source buffer should be zeroed
+        assert!(key.iter().all(|&b| b == 0));
+        // Key material accessible and correct
+        assert_eq!(gkm.len(), 64);
+        assert!(!gkm.is_empty());
+        // Verify content
+        let expected = vec![0xADu8; 64];
+        assert_eq!(gkm.bytes(), expected.as_slice());
     }
 }

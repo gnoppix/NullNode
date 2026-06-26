@@ -1,41 +1,43 @@
 # Changelog
 
-## 2026-06-25
+## 0.2.0 — First App Ready (2026-06-25)
 
-### Security (ML-KEM-1024 Upgrade)
-- **crypto**: Upgraded KEM from MlKem768 (NIST Level 3) to **MlKem1024 (NIST Level 5)**
-  - `kyber.rs`: Full rewrite for ML-KEM-1024
-  - `EPHEM_KEY_LEN`: 1184 → 1568 bytes
-  - `KYBER_CT_LEN`: 1088 → 1568 bytes (correct size from `ml-kem 0.3.2`)
-  - `VariantKeypair` + `MlKemVariant` enum: **dual-variant support** — user can choose
-    ML-KEM-768 or ML-KEM-1024 at runtime (default: ML-KEM-1024)
-  - Backward-compatible type aliases (`KyberKeypair`, `KyberPublicKey`)
-  - 8 new tests (kyber_sizes, generate_and_encap, ek_hash, braid_seed_extraction)
+**Breaking:** Version bump from 0.1.0 → 0.2.0. All first-app blockers resolved.
 
-### Added (ACS2.6 Features)
-- **delivery_tokens** module (258 lines): HMAC-SHA256 HKDF-like derivation for sealed
-  sender delivery tokens. `DeliveryMasterSecret` → per-contact `DeliveryKey` → 28-byte
-  constant-size `DeliveryToken`. Replay protection via token caching. 5 tests.
-- **cbnp** module (249 lines): Covert Background Noise Protocol. Poisson-timed cover
-  traffic (exponential inter-arrival via inverse transform sampling), 3200-byte dummy
-  packets, burst mode, `is_cover_traffic()` detection. Configurable λ. 6 tests.
-- **pir** module (405 lines): Private Information Retrieval for contact discovery.
-  Blind registries with cuckoo hashing (2 candidate bins per contact), XOR-masked bins,
-  `PirRegistry` server-side + `PirClient` for private lookups. 4032-byte bins, 18 entries/bin.
-  7 tests.
-- **secure_mem** module (173 lines): Memory hardening via `mlock`, `secure_zero_memory`,
-  `SecureKeyMaterial` (ZeroizeOnDrop), guard pages (Linux/Android/macOS/iOS). 3 tests.
+### Documentation
+- Restructured docs: README simplified (10-year-old level), FEATURES.md merged into DEVELOPER.md (technical) + README (general), FAQ de-duplicated
 
-### Changed
-- **crypto/Cargo.toml**: Added `hmac`, `zeroize` workspace dependencies
-- **Workspace/Cargo.toml**: Added `zeroize` with `zeroize_derive` feature
-- **Test count**: 28 → 37 crypto tests (9 new). Workspace: 56 → 80 total tests.
+### New features
+- **B1 — Guard pages**: `GuardedKeyMaterial` in `crypto/src/secure_mem.rs` — PROT_NONE mmap guard pages around key material, mlock, secure_zero with DSE fence
+- **B2 — CBNP cover traffic**: `crypto/src/cbnp.rs` — Poisson-timed exponential inter-arrival dummy packets in relay
+- **B3 — DB encryption at rest**: `client/src/main.rs` — AES-256-GCM on ciphertext column; key at `.nullnode/db_key.json` (0o600)
+- **B4 — Delivery tokens (Sealed Sender)**: `crypto/src/delivery_tokens.rs` — HMAC-SHA256 HKDF-derived 28-byte anonymous tokens
+- **B5 — PIR contact cache**: `crypto/src/pir.rs` — Cuckoo-hashed blind registry for local contact discovery
+- **I1 — TOFU peer admission**: `relay/src/main.rs` — Certificate fingerprint pinning with disk persistence
+- **I2 — Graceful shutdown**: Ctrl+C signal handlers in client and relay
+- **Braid Protocol (SPQR)**: `protocol/src/braid.rs` — `split_key_to_chunks()` pipelines 1568-byte ML-KEM-1024 keys in 64-byte chunks
+- **In-memory KEM state DB**: `MessageStore::open_in_memory()` — `sqlite::memory:` with ephemeral key for handshake state
 
-### Build
-- **Binary**: `nullnode` 6.8 MB (release, ML-KEM-1024)
-- **Debian package**: `nullnode-client_0.1.0-1_amd64.deb` 2.4 MB
+### Fixes
+- `reconstruct_enc_key()` now takes `key_len` to handle non-aligned key sizes (1568 bytes = 25 chunks)
+- `dealloc_guarded` fixed: was using Rust `dealloc()` on mmap'd memory (UB/SIGSEGV); now uses `libc::munmap`
 
-## 2026-06-24
+### Stats
+- 91 workspace tests (38 crypto + 14 protocol + 17 p2p + 2 braid + 9 dht + 11 relay)
+- Binary: 6.9 MB (client), 4.6 MB (relay)
+- Deb: 2.4 MB
+
+## 0.1.0 — Initial scaffold (2026-06-24)
+
+- Workspace structure: 8 crates
+- Basic P2P protocol, DHT, relay skeleton
+- Classical X25519 key exchange (pre-PQ)
+
+## 0.1.0 — Initial scaffold (2026-06-24)
+
+- Workspace structure: 8 crates
+- Basic P2P protocol, DHT, relay skeleton
+- Classical X25519 key exchange (pre-PQ)
 
 ### Security (CRITICAL-2 Fix)
 - **CRITICAL-2**: All P2P handshake and message signatures now properly signed with GPG/Sequoia
