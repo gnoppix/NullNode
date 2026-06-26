@@ -98,7 +98,7 @@ pub async fn handshake_initiator(
 
     // SECURITY FIX (M6): PoW data includes server_challenge to prevent replay
     let pow_data = format!("{}{}{}", peer_key, peer_nonce, server_challenge);
-    if !pow_check(&pow_data, peer_nonce, peer_pow_bits).unwrap_or(false) {
+    if !pow_check(&pow_data, peer_nonce, peer_pow_bits, &[]).unwrap_or(false) {
         return Err(P2pError::Handshake("peer PoW verification failed".to_string()));
     }
 
@@ -150,7 +150,7 @@ pub async fn handshake_responder(
     }
 
     let pow_data = format!("{}{}", peer_key, peer_nonce);
-    if !pow_check(&pow_data, peer_nonce, peer_pow_bits).unwrap_or(false) {
+    if !pow_check(&pow_data, peer_nonce, peer_pow_bits, &[]).unwrap_or(false) {
         return Err(P2pError::Handshake("peer PoW verification failed".to_string()));
     }
 
@@ -174,12 +174,14 @@ pub async fn handshake_responder(
 
 /// Solve PoW for a hello message.
 /// Uses a simple brute-force approach starting from base_nonce.
+/// SECURITY FIX (M11): Passes empty node_secret since P2P hello PoW
+/// is ephemeral (per-connection via server_challenge), not per-node.
 fn solve_hello_pow(public_key_b64: &str, base_nonce: u64, difficulty: u32) -> u64 {
     // Try up to 1M attempts
     for i in 0..1_000_000 {
         let nonce = base_nonce.wrapping_add(i);
         let data = format!("{}{}", public_key_b64, nonce);
-        if pow_check(&data, nonce, difficulty).unwrap_or(false) {
+        if pow_check(&data, nonce, difficulty, &[]).unwrap_or(false) {
             return nonce;
         }
     }
@@ -189,11 +191,13 @@ fn solve_hello_pow(public_key_b64: &str, base_nonce: u64, difficulty: u32) -> u6
 
 /// SECURITY FIX (M6): Solve PoW for a hello-ack message that includes
 /// the server_challenge. This makes the PoW unique per connection.
+/// SECURITY FIX (M11): Passes empty node_secret since P2P hello PoW
+/// is ephemeral (per-connection via server_challenge), not per-node.
 fn solve_hello_pow_challenged(public_key_b64: &str, base_nonce: u64, difficulty: u32, challenge: &str) -> u64 {
     for i in 0..1_000_000 {
         let nonce = base_nonce.wrapping_add(i);
         let data = format!("{}{}{}", public_key_b64, nonce, challenge);
-        if pow_check(&data, nonce, difficulty).unwrap_or(false) {
+        if pow_check(&data, nonce, difficulty, &[]).unwrap_or(false) {
             return nonce;
         }
     }
@@ -201,7 +205,9 @@ fn solve_hello_pow_challenged(public_key_b64: &str, base_nonce: u64, difficulty:
 }
 
 /// Verify a received handshake message's PoW.
+/// SECURITY FIX (M11): Passes empty node_secret since P2P hello PoW
+/// is ephemeral, not per-node.
 pub fn verify_hello_pow(public_key_b64: &str, nonce: u64, difficulty: u32) -> bool {
     let data = format!("{}{}", public_key_b64, nonce);
-    pow_check(&data, nonce, difficulty).unwrap_or(false)
+    pow_check(&data, nonce, difficulty, &[]).unwrap_or(false)
 }

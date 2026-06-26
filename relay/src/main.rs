@@ -11,7 +11,7 @@
 //-------------------------------------------------------------------------------
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -286,7 +286,8 @@ struct FederationState {
     /// Shared secret for HMAC peer authentication.
     shared_secret: Option<String>,
     /// Challenge we sent to peers (for replay protection).
-    pending_challenges: HashMap<String, String>, // relay_url -> challenge
+    /// SECURITY FIX (M12): Store challenge with creation timestamp for expiry.
+    pending_challenges: HashMap<String, (String, i64)>, // relay_url -> (challenge, created_at)
     /// Nonces seen from peers (replay protection).
     seen_nonces: HashMap<String, Vec<String>>, // peer_url -> nonces
 }
@@ -371,6 +372,13 @@ const STORE_TIMESTAMP_TOLERANCE_SECS: f64 = 300.0;
 /// Maximum number of per-sender nonces to retain for replay protection.
 const MAX_NONCES_PER_SENDER: usize = 1000;
 
+/// SECURITY FIX (H8): Maximum number of per-IP rate limiter entries.
+/// Prevents unbounded growth of the per-peer limiter map.
+const MAX_PEER_LIMITERS: usize = 10_000;
+
+/// SECURITY FIX (H8): Stale entry cleanup interval for per-IP rate limiters.
+const PEER_LIMITER_CLEANUP_SECS: u64 = 120;
+
 /// Global state shared across all relay connections.
 struct RelayState {
     mailboxes: RwLock<HashMap<String, Mailbox>>,
@@ -378,11 +386,14 @@ struct RelayState {
     /// SECURITY FIX (C4/H7): Replay protection — tracks seen nonces per sender.
     seen_nonces: RwLock<HashMap<String, Vec<i64>>>,
     /// SECURITY FIX (H3): Replay protection for string nonces (fetch requests).
-    seen_nonce_strs: RwLock<HashMap<String, Vec<String>>>,
+    /// Stores (nonce, timestamp) pairs for time-based eviction (H2).
+    seen_nonce_strs: RwLock<HashMap<String, Vec<(String, i64)>>>,
     /// SECURITY FIX (C4): GPG home directory (kept for backward compat / key storage).
     gpg_home: String,
-    /// SECURITY FIX (H2): Per-IP rate limiter to prevent connection flooding.
-    conn_limiter: nullnode_dht_core::RateLimiter,
+    /// SECURITY FIX (H8): Per-IP rate limiters to prevent connection flooding.
+    /// Each IP gets its own RateLimiter, so one attacker cannot exhaust the
+    /// global limit for all peers. Stale entries are cleaned up periodically.
+    conn_limiters: RwLock<HashMap<IpAddr, (nullnode_dht_core::RateLimiter, Instant)>>,
     /// Federation state for multi-relay routing.
     federation: RwLock<FederationState>,
     /// Cert cache: fingerprint -> armored cert (for Sequoia in-process verification).
@@ -402,8 +413,8 @@ impl RelayState {
             seen_nonces: RwLock::new(HashMap::new()),
             seen_nonce_strs: RwLock::new(HashMap::new()),
             gpg_home: gpg_home.clone(),
-            // SECURITY FIX (H2): 30 connections per 60s per IP
-            conn_limiter: nullnode_dht_core::RateLimiter::new(30, 60.0),
+            // SECURITY FIX (H8): Per-IP rate limiters — each IP gets 30 connections/60s
+            conn_limiters: RwLock::new(HashMap::new()),
             federation: RwLock::new(FederationState::new(shared_secret)),
             cert_cache: RwLock::new(HashMap::new()),
             known_peers: RwLock::new(known_peers),
@@ -438,6 +449,9 @@ impl RelayState {
 
     /// SECURITY FIX (C4/H7): Check and record a nonce for replay protection.
     /// Returns true if the nonce is fresh (not seen before), false if replayed.
+    ///
+    /// SECURITY FIX (H2): Evict nonces older than STORE_TIMESTAMP_TOLERANCE_SECS
+    /// to prevent unbounded memory growth from high-volume senders.
     async fn check_and_record_nonce(&self, sender_fp: &str, nonce: i64) -> bool {
         let mut nonces = self.seen_nonces.write().await;
         let entry = nonces.entry(sender_fp.to_string()).or_insert_with(Vec::new);
@@ -447,7 +461,11 @@ impl RelayState {
             return false;
         }
 
-        // Prune if too many nonces (keep last N)
+        // SECURITY FIX (H2): Evict nonces older than the time window
+        let cutoff = nonce - STORE_TIMESTAMP_TOLERANCE_SECS as i64;
+        entry.retain(|n| *n >= cutoff);
+
+        // Prune if still too many nonces (keep last N)
         if entry.len() >= MAX_NONCES_PER_SENDER {
             entry.drain(0..entry.len() / 2);
         }
@@ -458,19 +476,29 @@ impl RelayState {
 
     /// SECURITY FIX (H3): Check and record a string nonce for replay protection
     /// on fetch requests. Returns true if fresh, false if replayed.
+    ///
+    /// SECURITY FIX (H2): Evict nonces older than STORE_TIMESTAMP_TOLERANCE_SECS.
     async fn check_and_record_nonce_str(&self, sender_fp: &str, nonce: &str) -> bool {
         let mut nonces = self.seen_nonce_strs.write().await;
         let entry = nonces.entry(sender_fp.to_string()).or_insert_with(Vec::new);
 
-        if entry.contains(&nonce.to_string()) {
+        if entry.iter().any(|(n, _)| n == nonce) {
             return false;
         }
+
+        // SECURITY FIX (H2): Evict nonces older than the time window
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now - STORE_TIMESTAMP_TOLERANCE_SECS as i64;
+        entry.retain(|(_, ts)| *ts >= cutoff);
 
         if entry.len() >= MAX_NONCES_PER_SENDER {
             entry.drain(0..entry.len() / 2);
         }
 
-        entry.push(nonce.to_string());
+        entry.push((nonce.to_string(), now));
         true
     }
 
@@ -621,11 +649,28 @@ async fn handle_connection(
     state: Arc<RelayState>,
     tls_acceptor: Option<TlsAcceptor>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // SECURITY FIX (H2): Per-IP rate limiting to prevent connection flooding.
-    let ip_key = addr.ip().to_string();
-    if !state.conn_limiter.allow(&ip_key).await {
-        tracing::warn!(rate_limited=true, ip=%ip_key, "relay connection rejected (rate limit)");
-        return Ok(());
+    // SECURITY FIX (H8): Per-IP rate limiting to prevent connection flooding.
+    // Each IP address gets its own RateLimiter so one attacker cannot exhaust
+    // the global limit for all peers.
+    let ip = addr.ip();
+    {
+        let mut limiters = state.conn_limiters.write().await;
+        let now = Instant::now();
+        let entry = limiters.entry(ip).or_insert_with(|| {
+            (nullnode_dht_core::RateLimiter::new(30, 60.0), now)
+        });
+        entry.1 = now; // update last-access time
+        if !entry.0.allow(&ip.to_string()).await {
+            drop(limiters); // release lock before warn log
+            tracing::warn!(rate_limited=true, ip=%ip, "relay connection rejected (per-IP rate limit)");
+            return Ok(());
+        }
+        // SECURITY FIX (H8): Evict oldest entry if map is full
+        if limiters.len() > MAX_PEER_LIMITERS {
+            if let Some(oldest_ip) = limiters.iter().min_by_key(|(_, (_, ts))| *ts).map(|(k, _)| *k) {
+                limiters.remove(&oldest_ip);
+            }
+        }
     }
 
     // SECURITY FIX (C5): Both TLS and plaintext branches box to the same type.
@@ -1086,7 +1131,12 @@ async fn handle_message(
                 .map_err(|e| format!("invalid peer-auth: {}", e))?;
             let mut fed = state.federation.write().await;
             // Store the challenge we received (we'll respond with HMAC)
-            fed.pending_challenges.insert(auth.relay_url.clone(), auth.challenge.clone());
+            // SECURITY FIX (M12): Store challenge with timestamp for expiry.
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            fed.pending_challenges.insert(auth.relay_url.clone(), (auth.challenge.clone(), now_ts));
             // Compute HMAC response
             if let Some(ref secret) = fed.shared_secret {
                 let response = compute_hmac(&auth.challenge, secret);
@@ -1115,7 +1165,15 @@ async fn handle_message(
                 .map_err(|e| format!("invalid peer-auth-reply: {}", e))?;
             let mut fed = state.federation.write().await;
             // Verify HMAC
-            if let Some(challenge) = fed.pending_challenges.remove(&reply.relay_url) {
+            if let Some((challenge, created_at)) = fed.pending_challenges.remove(&reply.relay_url) {
+                // SECURITY FIX (M12): Reject expired challenges (5 minute window).
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                if now_ts - created_at > 300 {
+                    return Err("challenge expired".to_string());
+                }
                 if let Some(ref secret) = fed.shared_secret {
                     let expected = compute_hmac(&challenge, secret);
                     if expected == reply.response {
@@ -1656,6 +1714,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::debug!("mailbox cleanup complete");
         }
     });
+
+    // SECURITY FIX (H8): Periodic cleanup of stale per-IP rate limiters.
+    // Remove entries that haven't been accessed in PEER_LIMITER_CLEANUP_SECS.
+    {
+        let limiter_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(PEER_LIMITER_CLEANUP_SECS));
+            loop {
+                interval.tick().await;
+                let mut limiters = limiter_state.conn_limiters.write().await;
+                let cutoff = Instant::now() - Duration::from_secs(PEER_LIMITER_CLEANUP_SECS * 2);
+                limiters.retain(|_, (_, last_access)| *last_access > cutoff);
+                tracing::debug!(active_limiters=limiters.len(), "per-IP rate limiter cleanup complete");
+            }
+        });
+    }
 
     // Background task: gossip-based route advertisement
     let gossip_state = Arc::clone(&state);

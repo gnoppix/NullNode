@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.2 — Nginx TLS Proxy & WSS Support (2026-06-26)
+
+### New features
+- **WssThe smartest implementation here is simpler than the blueprint. You want nginx on :443 terminating TLS, so the bootstrap server stays plaintext on localhost. Three actual code changes needed:
+
+1. **Client wss:// support** — `dht_lookup` and `relay_fetch` currently do `https:// → wss://` string replacement but then connect with plaintext TCP. Now they actually do TLS.
+2. **Bootstrap `--advertised-url`** — when behind nginx, the DHT records must advertise `wss://public-domain` instead of `ws://localhost:9001`.
+3. **P2P wss:// support** — `connect_direct` now handles both `ws://` and `wss://` schemes.
+
+### Implementation notes
+- `tokio-tungstenite` now uses `rustls-tls-native-roots` feature (client + p2p crates) for native wss:// support
+- No custom TLS code in any crate — tokio-tungstenite handles TLS via rustls with WebPKI verification
+- Nginx handles TLS termination; the daemon binds to `127.0.0.1` and never sees TLS
+- `--advertised-url` sets `NodeConfig.advertised_url` in dht-core, which the DHT node uses as its public address
+- All 86 existing tests pass
+
+### Documentation
+- Added `docs/nginx-proxy.md` — full nginx config with WebSocket upgrade, fallback page, rate limiting
+
+## 0.2.1 — Alias convenience (2026-06-26)
+
+### New features
+- **Alias system**: `nullnode alias <name> <NID>` maps human-readable names to Null IDs
+- `nullnode aliases` lists all configured aliases
+- `send`, `chat`, `verify`, `safety-number` now accept alias or raw Null ID
+- Alias storage at `~/.nullnode/aliases.json` (0o600 permissions)
+
 ## 0.2.0 — First App Ready (2026-06-25)
 
 **Breaking:** Version bump from 0.1.0 → 0.2.0. All first-app blockers resolved.

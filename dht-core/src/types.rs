@@ -21,6 +21,11 @@ pub struct NodeConfig {
     pub ssl_keyfile: String,
     pub stealth_mode: bool,
     pub db_path: Option<String>,
+    /// Public URL advertised in DHT records when behind a reverse proxy.
+    /// If set, this URL is used as the node's address in DHT instead of host:port.
+    /// Example: "wss://bootstrap.gnoppix.org" when nginx terminates TLS on :443
+    /// and forwards to the node on localhost:9001.
+    pub advertised_url: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -34,6 +39,7 @@ impl Default for NodeConfig {
             ssl_keyfile: String::new(),
             stealth_mode: false,
             db_path: None,
+            advertised_url: None,
         }
     }
 }

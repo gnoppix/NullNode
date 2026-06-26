@@ -21,6 +21,12 @@ pub const DHT_PORT: u16 = 6881;
 pub const K_BUCKET_SIZE: usize = 8;
 pub const MAX_STORE_PER_KEY: usize = 100;
 pub const STORE_TTL: i64 = 86400; // 24 hours
+/// SECURITY FIX (H6): Maximum allowed TTL for DHT records.
+/// Prevents infinite-lived records that could bloat the DHT store.
+pub const MAX_TTL: i64 = 604800; // 7 days
+/// SECURITY FIX (H7): Maximum allowed key size in bytes/chars.
+/// Prevents excessively long keys from consuming disproportionate storage.
+pub const MAX_KEY_SIZE: usize = 256;
 pub const ADDR_TTL: i64 = 7200; // 2 hours
 pub const POW_MAX_AGE: i64 = 300; // 5 minutes
 pub const MAX_VALUE_SIZE: usize = 4096; // 4 KB
@@ -32,6 +38,10 @@ pub const DHT_POW_TIME_COST: u32 = 3;
 pub const DHT_POW_PARALLELISM: u32 = 1;
 pub const DHT_POW_HASH_LEN: usize = 32;
 pub const DHT_POW_DIFFICULTY: u32 = 16;
+
+/// SECURITY FIX (M9): Minimum allowed PoW difficulty.
+/// Prevents attackers from setting difficulty=0 to bypass PoW entirely.
+pub const MIN_POW_DIFFICULTY: u32 = 8;
 
 /// SECURITY FIX (L7): PoW difficulty for addr-record writes.
 /// Lower than DHT_POW_DIFFICULTY since addr records are smaller and more

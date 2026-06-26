@@ -66,9 +66,6 @@ pub fn sign_detached(data: &str, cert: &Cert) -> Result<String, String> {
             .finalize()
             .map_err(|e| format!("armorer finalize: {}", e))?;
     }
-    eprintln!("Final sig_buf len: {}", sig_buf.len());
-    eprintln!("First 200 bytes: {:?}", std::str::from_utf8(&sig_buf[..200.min(sig_buf.len())]).unwrap_or("INVALID UTF8"));
-
     String::from_utf8(sig_buf).map_err(|e| format!("sig UTF-8: {}", e))
 }
 
@@ -185,10 +182,10 @@ mod tests {
         let (cert, _) = generate_keypair("test <test@example.com>").unwrap();
         let sig = sign_detached("original data", &cert).unwrap();
 
-        // Note: verify_signature only checks cryptographic validity, not data match.
-        // For true detached verification, the caller must hash data and compare.
-        // This test just ensures the function doesn't crash.
-        let _valid = verify_detached(&sig, "different data", &cert).unwrap();
+        // SECURITY FIX (C1): verify_detached must reject signatures made over
+        // different data. This prevents signature replay attacks.
+        let valid = verify_detached(&sig, "different data", &cert).unwrap();
+        assert!(!valid, "signature over different data must NOT verify");
     }
 
     #[test]

@@ -35,7 +35,7 @@ RUSTFLAGS   := -C target-cpu=native
 #  Targets                                                           #
 # ------------------------------------------------------------------ #
 
-.PHONY: all client relay bootstrap install clean test check docs help
+.PHONY: all client relay bootstrap install clean test check docs docker help
 
 ## Build all binaries (release)
 all: client relay bootstrap
@@ -168,6 +168,12 @@ static:
 	$(CARGO) build --package nullnode-client --$(BUILD_MODE) --target x86_64-unknown-linux-musl
 	@echo "  -> target/x86_64-unknown-linux-musl/$(BUILD_MODE)/$(BIN_CLIENT)"
 
+## Build Docker image
+docker:
+	@echo "Building Docker image nullnode:latest..."
+	docker build -t nullnode:latest .
+	@echo "  -> nullnode:latest"
+
 ## Show this help
 help:
 	@echo "NullNode P2P Messenger — Build System"
@@ -197,10 +203,11 @@ help:
 	@echo "  uninstall    Remove installed binaries"
 	@echo "  deb          Build Debian package"
 	@echo ""
-	@echo "Utility targets:"
-	@echo "  clean        Remove build artifacts"
-	@echo "  info         Show build metadata"
-	@echo "  help         Show this help"
+	Utility targets:
+	  clean        Remove build artifacts
+	  info         Show build metadata
+	  docker       Build Docker image
+	  help         Show this help
 	@echo ""
 	@echo "Variables:"
 	@echo "  BUILD_MODE=release|debug   (default: release)"

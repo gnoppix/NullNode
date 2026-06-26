@@ -5,6 +5,7 @@
 // Author: Andreas Mueller
 // Website: https://www.gnoppix.com
 // Licence: Business Source License (BSL / BUSL)
+// You can use the code for free if your company or organisation doesn't have more than 2 people.
 //-------------------------------------------------------------------------------
 // NullNode ML-KEM-1024 KEM — Post-quantum key exchange (NIST Level 5)
 //

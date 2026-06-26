@@ -39,25 +39,64 @@ pub enum PowError {
     Argon2Hash(String),
     #[error("PoW difficulty too high - no valid nonce found within max attempts")]
     DifficultyTooHigh,
+    #[error("PoW difficulty {0} is below minimum allowed ({1})")]
+    DifficultyTooLow(u32, u32),
+}
+
+/// Derive a per-node salt from the static POW_SALT and a node secret.
+///
+/// SECURITY FIX (M11): Concatenates the shared POW_SALT with a per-node
+/// secret to produce a unique salt per node. This prevents attackers from
+/// precomputing PoW solutions that work across all DHT nodes.
+pub fn node_pow_salt(node_secret: &[u8]) -> Vec<u8> {
+    let mut salt = constants::POW_SALT.to_vec();
+    salt.extend_from_slice(node_secret);
+    salt
 }
 
 /// Verify Argon2id PoW: check that hash has at least `difficulty` leading zero bits.
 ///
 /// SECURITY: Argon2id-only. No SHA-256 fallback - this ensures memory-hard
 /// PoW is always used, maintaining GPU/ASIC resistance.
-pub fn pow_check(data: &str, nonce: u64, difficulty: u32) -> Result<bool, PowError> {
+///
+/// SECURITY FIX (M11): `node_secret` is mixed into the salt to make PoW
+/// computation unique per node. Without this, all nodes share the same
+/// static salt, allowing attackers to precompute PoW solutions.
+pub fn pow_check(
+    data: &str,
+    nonce: u64,
+    difficulty: u32,
+    node_secret: &[u8],
+) -> Result<bool, PowError> {
+    // SECURITY FIX (M9): Enforce minimum PoW difficulty.
+    if difficulty < constants::MIN_POW_DIFFICULTY {
+        return Err(PowError::DifficultyTooLow(
+            difficulty,
+            constants::MIN_POW_DIFFICULTY,
+        ));
+    }
+
     let params = Params::new(
         constants::DHT_POW_MEMORY_COST,
         constants::DHT_POW_TIME_COST,
         constants::DHT_POW_PARALLELISM,
         Some(constants::DHT_POW_HASH_LEN),
-    ).map_err(|e| PowError::Argon2Params(e.to_string()))?;
+    )
+    .map_err(|e| PowError::Argon2Params(e.to_string()))?;
 
     let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-    let secret = format!("{}{}", data, nonce);
+    // SECURITY FIX (M8): Use length-prefixed input to prevent ambiguity.
+    // Without delimiter, data="ab" + nonce="c12" == data="abc" + nonce="12".
+    // The colon delimiter ensures unique input for every (data, nonce) pair.
+    let secret = format!("{}:{}", data, nonce);
+
+    // SECURITY FIX (M11): Per-node salt = POW_SALT || node_secret
+    let salt = node_pow_salt(node_secret);
+
     let mut raw = [0u8; constants::DHT_POW_HASH_LEN];
-    hasher.hash_password_into(secret.as_bytes(), constants::POW_SALT, &mut raw)
+    hasher
+        .hash_password_into(secret.as_bytes(), &salt, &mut raw)
         .map_err(|e| PowError::Argon2Hash(e.to_string()))?;
 
     Ok(leading_zero_bits(&raw) >= difficulty)
@@ -67,24 +106,42 @@ pub fn pow_check(data: &str, nonce: u64, difficulty: u32) -> Result<bool, PowErr
 ///
 /// SECURITY: Argon2id-only. Returns error if memory allocation fails instead
 /// of falling back to SHA-256 hashcash.
+///
+/// SECURITY FIX (M11): `node_secret` is mixed into the salt to make PoW
+/// computation unique per node. Callers should pass `None` for situations
+/// where no per-node secret is relevant (e.g., P2P hello).
 pub fn pow_solve(
     data: &str,
     difficulty: u32,
     max_attempts: u64,
+    node_secret: &[u8],
 ) -> Result<Option<u64>, PowError> {
+    // SECURITY FIX (M9): Enforce minimum PoW difficulty.
+    if difficulty < constants::MIN_POW_DIFFICULTY {
+        return Err(PowError::DifficultyTooLow(
+            difficulty,
+            constants::MIN_POW_DIFFICULTY,
+        ));
+    }
+
     let params = Params::new(
         constants::DHT_POW_MEMORY_COST,
         constants::DHT_POW_TIME_COST,
         constants::DHT_POW_PARALLELISM,
         Some(constants::DHT_POW_HASH_LEN),
-    ).map_err(|e| PowError::Argon2Params(e.to_string()))?;
+    )
+    .map_err(|e| PowError::Argon2Params(e.to_string()))?;
 
     let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
+    let salt = node_pow_salt(node_secret);
+
     for nonce in 0..max_attempts {
-        let secret = format!("{}{}", data, nonce);
+        // SECURITY FIX (M8): Use length-prefixed input to prevent ambiguity.
+        let secret = format!("{}:{}", data, nonce);
         let mut raw = [0u8; constants::DHT_POW_HASH_LEN];
-        hasher.hash_password_into(secret.as_bytes(), constants::POW_SALT, &mut raw)
+        hasher
+            .hash_password_into(secret.as_bytes(), &salt, &mut raw)
             .map_err(|e| PowError::Argon2Hash(e.to_string()))?;
 
         if leading_zero_bits(&raw) >= difficulty {
@@ -127,9 +184,56 @@ mod tests {
 
     #[test]
     fn test_argon2_pow_low_difficulty() {
-        // Difficulty 4 should find a nonce very quickly
-        let nonce = pow_solve("test", 4, 10000).unwrap().unwrap();
-        assert!(pow_check("test", nonce, 4).unwrap());
+        // Difficulty 8 is the minimum allowed (MIN_POW_DIFFICULTY)
+        let node_secret = b"test-node-secret";
+        let nonce = pow_solve("test", 8, 100000, node_secret).unwrap().unwrap();
+        assert!(pow_check("test", nonce, 8, node_secret).unwrap());
+    }
+
+    #[test]
+    fn test_argon2_pow_per_node_salt() {
+        // SECURITY FIX (M11): PoW solutions must be unique per node.
+        // A nonce found for one node_secret must NOT verify for a different node_secret.
+        let secret_a = b"node-alpha-secret";
+        let secret_b = b"node-beta-secret";
+        let nonce = pow_solve("test", 8, 100000, secret_a).unwrap().unwrap();
+        // Should verify for node A
+        assert!(pow_check("test", nonce, 8, secret_a).unwrap());
+        // Should NOT verify for node B (different salt)
+        assert!(!pow_check("test", nonce, 8, secret_b).unwrap());
+    }
+
+    #[test]
+    fn test_pow_minimum_difficulty_enforcement() {
+        // SECURITY FIX (M9): Difficulty below MIN_POW_DIFFICULTY must be rejected.
+        let node_secret = b"test-node-secret";
+
+        // pow_solve should reject difficulty < 8
+        let result = pow_solve("test", 0, 10000, node_secret);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), PowError::DifficultyTooLow(0, 8)));
+
+        let result = pow_solve("test", 7, 10000, node_secret);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), PowError::DifficultyTooLow(7, 8)));
+
+        // pow_check should reject difficulty < 8
+        let result = pow_check("test", 0, 0, node_secret);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), PowError::DifficultyTooLow(0, 8)));
+
+        let result = pow_check("test", 0, 5, node_secret);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), PowError::DifficultyTooLow(5, 8)));
+
+        // Exactly MIN_POW_DIFFICULTY should be accepted (not rejected)
+        // Note: we don't actually solve, just verify the check doesn't reject it.
+        // pow_check with difficulty=8 will return Ok(false) for a random nonce, not an error.
+        let result = pow_check("test", 0, 8, node_secret);
+        assert!(result.is_ok());
+
+        let result = pow_solve("test", 8, 1, node_secret);
+        assert!(result.is_ok());
     }
 
     #[test]

@@ -13,7 +13,7 @@ hex.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio-tungstenite.workspace = true
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
 url.workspace = true
 futures.workspace = true
 

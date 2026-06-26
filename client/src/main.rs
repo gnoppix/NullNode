@@ -37,6 +37,7 @@ use base64::Engine;
 
 const GPG_HOME: &str = ".nullnode/gnupg";
 const CONTACTS_PATH: &str = ".nullnode/contacts.json";
+const ALIASES_PATH: &str = ".nullnode/aliases.json";
 const DELIVERY_SECRETS_PATH: &str = ".nullnode/delivery_secrets.json";
 const IDENTITY_PATH: &str = ".nullnode/identity.json";
 const BOOTSTRAP_PATH: &str = ".nullnode/bootstrap_pin_cache.json";
@@ -246,6 +247,63 @@ fn save_contacts(contacts: &Contacts) -> Result<(), Box<dyn std::error::Error>> 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------ //
+//  Aliases                                                          //
+// ------------------------------------------------------------------ //
+
+type Aliases = HashMap<String, String>; // alias -> null_id
+
+fn load_aliases() -> Aliases {
+    let path = home_dir().join(ALIASES_PATH);
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_aliases(aliases: &Aliases) -> Result<(), Box<dyn std::error::Error>> {
+    let path = home_dir().join(ALIASES_PATH);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(aliases)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Resolve a user-provided recipient string to a Null ID.
+/// If the input matches a known alias, return the mapped null_id.
+/// Otherwise return the input unchanged (assumed to be a raw null_id).
+fn resolve_recipient(input: &str, aliases: &Aliases) -> String {
+    aliases.get(input).cloned().unwrap_or_else(|| input.to_string())
+}
+
+// ------------------------------------------------------------------ //
+//  WebSocket Transport (ws:// + wss://)                              //
+// ------------------------------------------------------------------ //
+
+/// Connect a WebSocket, supporting both ws:// and wss:// URLs.
+/// For wss://, tokio-tungstenite handles TLS automatically via rustls-native-tls
+/// with WebPKI certificate verification.
+/// Returns a WebSocket stream over MaybeTlsStream (TLS when scheme is wss://).
+#[allow(clippy::type_complexity)]
+async fn ws_connect(
+    url: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Box<dyn std::error::Error>,
+> {
+    tokio_tungstenite::connect_async(url)
+        .await
+        .map(|(ws, _)| ws)
+        .map_err(|e| format!("WebSocket connect failed: {}", e).into())
 }
 
 // ------------------------------------------------------------------ //
@@ -650,9 +708,12 @@ fn generate_identity() -> Result<Identity, Box<dyn std::error::Error>> {
 async fn dht_lookup(seed_url: &str, null_id: &str) -> Result<String, Box<dyn std::error::Error>> {
     use nullnode_protocol::envelope::WireEnvelope;
 
-    let ws_url = seed_url.replace("http://", "ws://").replace("https://", "wss://");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
-        .await
+    // Normalize URL scheme: https:// → wss://, http:// → ws://
+    let ws_url = seed_url
+        .replace("http://", "ws://")
+        .replace("https://", "wss://");
+
+    let mut ws = ws_connect(&ws_url).await
         .map_err(|e| format!("DHT connect failed: {}", e))?;
 
     // SECURITY FIX (C2): Sign the dht-get request
@@ -700,8 +761,7 @@ async fn dht_lookup(seed_url: &str, null_id: &str) -> Result<String, Box<dyn std
 /// Uses relay-fetch protocol with GPG signature for authentication.
 async fn relay_fetch(relay_url: &str, null_id: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let ws_url = relay_url.replace("http://", "ws://").replace("https://", "wss://");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
-        .await
+    let mut ws = ws_connect(&ws_url).await
         .map_err(|e| format!("Relay connect failed: {}", e))?;
 
     // Load identity to get fingerprint for signing and cert for TOFU
@@ -1170,9 +1230,18 @@ enum Commands {
     },
     /// Show your safety number for a contact (G6)
     SafetyNumber {
-        /// Contact Null ID
+        /// Contact Null ID or alias
         null_id: String,
     },
+    /// Assign a human-readable name to a Null ID
+    Alias {
+        /// Short alias name (e.g. "Bob-office")
+        alias: String,
+        /// The Null ID to map
+        null_id: String,
+    },
+    /// List all aliases
+    Aliases,
 }
 
 #[tokio::main]
@@ -1212,7 +1281,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Send { to, message } => {
             let store = MessageStore::open().await?;
             let identity = Identity::load()?;
-            send_message(&identity, &to, &message, &store).await?;
+            let aliases = load_aliases();
+            let resolved_to = resolve_recipient(&to, &aliases);
+            send_message(&identity, &resolved_to, &message, &store).await?;
         }
         Commands::Read => {
             let store = MessageStore::open().await?;
@@ -1311,21 +1382,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Verify { null_id } => {
             let contacts = load_contacts();
-            let fp = contacts.get(&null_id).ok_or("unknown contact — add with 'add-contact' first")?;
+            let aliases = load_aliases();
+            let resolved_nid = resolve_recipient(&null_id, &aliases);
+            let fp = contacts.get(&resolved_nid).ok_or("unknown contact — add with 'add-contact' first")?;
             let identity = Identity::load()?;
             let sn = safety_number(&identity.fingerprint, fp);
-            println!("Safety number for {}:", null_id);
+            println!("Safety number for {}:", resolved_nid);
             println!("  {}", sn);
             println!("\nVerify this matches your contact's safety number.");
             println!("If it doesn't match, a man-in-the-middle may be intercepting your communication.");
         }
         Commands::SafetyNumber { null_id } => {
             let contacts = load_contacts();
-            let fp = contacts.get(&null_id).ok_or("unknown contact — add with 'add-contact' first")?;
+            let aliases = load_aliases();
+            let resolved_nid = resolve_recipient(&null_id, &aliases);
+            let fp = contacts.get(&resolved_nid).ok_or("unknown contact — add with 'add-contact' first")?;
             let identity = Identity::load()?;
             let sn = safety_number(&identity.fingerprint, fp);
-            println!("Your safety number with {}:", null_id);
+            println!("Your safety number with {}:", resolved_nid);
             println!("  {}", sn);
+        }
+        Commands::Alias { alias, null_id } => {
+            // Validate that the null_id exists in contacts
+            let contacts = load_contacts();
+            if !contacts.contains_key(&null_id) {
+                return Err(format!("unknown Null ID: {} — add it first with 'add-contact {} <fingerprint>'", null_id, null_id).into());
+            }
+            let mut aliases = load_aliases();
+            aliases.insert(alias.clone(), null_id.clone());
+            save_aliases(&aliases)?;
+            println!("Alias set: {} -> {}", alias, null_id);
+        }
+        Commands::Aliases => {
+            let aliases = load_aliases();
+            if aliases.is_empty() {
+                println!("No aliases. Add one with: nullnode alias <name> <null_id>");
+            } else {
+                println!("Aliases:");
+                for (alias, nid) in &aliases {
+                    println!("  {} -> {}", alias, nid);
+                }
+            }
         }
     }
 

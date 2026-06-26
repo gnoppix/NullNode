@@ -82,18 +82,42 @@ impl TransportManager {
         uri: &str,
         timeout_secs: u64,
     ) -> Result<WebSocketConn, P2pError> {
-        let _url = Url::parse(uri).map_err(|e| P2pError::InvalidAddress(e.to_string()))?;
+        let url = Url::parse(uri).map_err(|e| P2pError::InvalidAddress(e.to_string()))?;
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            tokio_tungstenite::connect_async(uri),
-        )
-        .await;
+        match url.scheme() {
+            "ws" => {
+                // Plaintext WebSocket (unchanged)
+                let result = tokio::time::timeout(
+                    Duration::from_secs(timeout_secs),
+                    tokio_tungstenite::connect_async(uri),
+                )
+                .await;
 
-        match result {
-            Ok(Ok((ws, _))) => Ok(ws),
-            Ok(Err(e)) => Err(P2pError::Connection(e.to_string())),
-            Err(_) => Err(P2pError::Timeout),
+                match result {
+                    Ok(Ok((ws, _))) => Ok(ws),
+                    Ok(Err(e)) => Err(P2pError::Connection(e.to_string())),
+                    Err(_) => Err(P2pError::Timeout),
+                }
+            }
+            "wss" => {
+                // TLS WebSocket — tokio-tungstenite handles this natively
+                // when the "rustls-tls-native-roots" feature is enabled.
+                let result = tokio::time::timeout(
+                    Duration::from_secs(timeout_secs),
+                    tokio_tungstenite::connect_async(uri),
+                )
+                .await;
+
+                match result {
+                    Ok(Ok((ws, _))) => Ok(ws),
+                    Ok(Err(e)) => Err(P2pError::Connection(e.to_string())),
+                    Err(_) => Err(P2pError::Timeout),
+                }
+            }
+            other => Err(P2pError::InvalidAddress(format!(
+                "unsupported scheme: {}",
+                other
+            ))),
         }
     }
 

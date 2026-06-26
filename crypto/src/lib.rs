@@ -38,6 +38,7 @@ use ml_kem::kem::{Decapsulate, KeyExport};
 use ml_kem::MlKem1024;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use nullnode_protocol::pow::blake2b_8_hex;
 
@@ -200,6 +201,9 @@ pub fn encrypt(
         .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| CryptoError::EncryptFailed(e.to_string()))?;
 
+    // SECURITY FIX (C2): Zeroize sensitive key material after use
+    aes_key.zeroize();
+
     // Assemble: ephemeral_enc_key || kyber_ct || nonce || aes_ct
     let mut output = Vec::new();
     output.extend_from_slice(ephemeral_kp.enc.to_bytes().as_ref());
@@ -259,6 +263,9 @@ pub fn decrypt(
     let plaintext = cipher
         .decrypt(nonce, aes_ct)
         .map_err(|e| CryptoError::DecryptFailed(format!("AES-GCM decrypt: {}", e)))?;
+
+    // SECURITY FIX (C2): Zeroize sensitive key material after use
+    aes_key.zeroize();
 
     String::from_utf8(plaintext).map_err(|e| CryptoError::DecryptFailed(format!("utf-8: {}", e)))
 }
@@ -435,6 +442,10 @@ impl DoubleRatchetSession {
             .encrypt(&nonce, payload_json.as_bytes())
             .map_err(|e| CryptoError::EncryptFailed(e.to_string()))?;
 
+        // SECURITY FIX (C2): Zeroize sensitive key material after use
+        aes_key.zeroize();
+        combined_secret.zeroize();
+
         // Assemble: ephemeral_enc_key || kyber_ct || nonce || aes_ct
         let mut output = Vec::new();
         output.extend_from_slice(ephemeral_kp.enc.to_bytes().as_ref());
@@ -461,7 +472,7 @@ impl DoubleRatchetSession {
             ct_hex,
             format!("{:x}", hasher.finalize())
         ))
-    }
+        }
 
     /// Decrypt a message with Kyber-768 KEM + ratchet.
     pub fn decrypt_message(
@@ -572,6 +583,11 @@ impl DoubleRatchetSession {
             .decrypt(nonce, aes_ct)
             .map_err(|e| CryptoError::DecryptFailed(format!("AES-GCM decrypt: {}", e)))?;
 
+        // SECURITY FIX (C2): Zeroize sensitive key material after use
+        aes_key.zeroize();
+        combined_secret.zeroize();
+        // shared_secret is Copy; the combined_secret buffer captured its contribution
+
         self.recv_seq = std::cmp::max(self.recv_seq, claimed_seq + 1);
         self.ratchet_step(false);
 
@@ -584,6 +600,7 @@ impl DoubleRatchetSession {
         )
     }
 
+    /// Try to process any pending messages that are next in the sequence.
     /// Try to process any pending messages that are next in the sequence.
     ///
     /// SECURITY FIX (C2): Each pending message has its own Kyber ciphertext
@@ -622,6 +639,10 @@ impl DoubleRatchetSession {
             let plaintext = cipher
                 .decrypt(nonce, pending.aes_ct.as_ref())
                 .map_err(|e| CryptoError::DecryptFailed(format!("AES-GCM decrypt: {}", e)))?;
+
+            // SECURITY FIX (C2): Zeroize sensitive key material after use
+            aes_key.zeroize();
+            combined_secret.zeroize();
 
             let claimed_seq = self.recv_seq;
             self.recv_seq = claimed_seq + 1;

@@ -13,32 +13,79 @@ use hmac::Hmac;
 use sequoia_openpgp::serialize::Serialize;
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::RwLock;
+use std::time::Instant;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// In-memory cert cache: fingerprint -> armored cert.
-/// Populated on first sight (TOFU) when publishers include their cert.
-static CERT_CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+/// SECURITY FIX (H10): Maximum number of entries in the cert cache.
+/// Prevents unbounded memory growth from too many unique certificates.
+const CERT_CACHE_MAX_ENTRIES: usize = 1000;
 
-/// Get or initialize the cert cache.
-fn cert_cache() -> std::sync::MutexGuard<'static, Option<HashMap<String, String>>> {
-    CERT_CACHE.lock().expect("cert cache lock poisoned")
+/// In-memory cert cache: fingerprint -> (armored cert, last access time).
+/// Populated on first sight (TOFU) when publishers include their cert.
+///
+/// SECURITY FIX (H10): Bounded cache with LRU eviction. When the cache
+/// exceeds CERT_CACHE_MAX_ENTRIES, the least-recently-accessed entry is
+/// evicted to prevent unbounded memory growth.
+static CERT_CACHE: RwLock<Option<HashMap<String, (String, Instant)>>> = RwLock::new(None);
+
+/// Get or initialize the cert cache (read guard).
+fn cert_cache_read() -> std::sync::RwLockReadGuard<'static, Option<HashMap<String, (String, Instant)>>> {
+    CERT_CACHE.read().expect("cert cache lock poisoned")
+}
+
+/// Get or initialize the cert cache (write guard).
+fn cert_cache_write() -> std::sync::RwLockWriteGuard<'static, Option<HashMap<String, (String, Instant)>>> {
+    CERT_CACHE.write().expect("cert cache lock poisoned")
 }
 
 /// Store an armored cert in the cache for the given fingerprint.
+///
+/// SECURITY FIX (H10): Evicts the least-recently-accessed entry when
+/// the cache exceeds CERT_CACHE_MAX_ENTRIES.
 pub fn cache_cert(fingerprint: &str, armored: &str) {
-    let mut guard = cert_cache();
+    let mut guard = cert_cache_write();
     if guard.is_none() {
         *guard = Some(HashMap::new());
     }
-    guard.as_mut().unwrap().insert(fingerprint.to_uppercase(), armored.to_string());
+    let cache = guard.as_mut().unwrap();
+    let key = fingerprint.to_uppercase();
+    cache.insert(key.clone(), (armored.to_string(), Instant::now()));
+
+    // SECURITY FIX (H10): Evict LRU entry if over capacity
+    if cache.len() > CERT_CACHE_MAX_ENTRIES {
+        if let Some(lru_key) = cache.iter().min_by_key(|(_, (_, ts))| *ts).map(|(k, _)| k.clone()) {
+            cache.remove(&lru_key);
+        }
+    }
 }
 
 /// Look up a cached cert by fingerprint.
+///
+/// SECURITY FIX (H10): Updates the last access time on lookup (true LRU behavior).
 pub fn get_cached_cert(fingerprint: &str) -> Option<String> {
-    let guard = cert_cache();
-    guard.as_ref()?.get(&fingerprint.to_uppercase()).cloned()
+    // First try read lock for lookup
+    {
+        let guard = cert_cache_read();
+        if let Some(ref cache) = *guard {
+            if let Some((cert, _)) = cache.get(&fingerprint.to_uppercase()) {
+                let cert = cert.clone();
+                drop(guard);
+                // Update access time with write lock
+                {
+                    let mut write_guard = cert_cache_write();
+                    if let Some(ref mut cache) = *write_guard {
+                        if let Some(entry) = cache.get_mut(&fingerprint.to_uppercase()) {
+                            entry.1 = Instant::now();
+                        }
+                    }
+                }
+                return Some(cert);
+            }
+        }
+    }
+    None
 }
 
 /// Fingerprint format: 32 or 40 hex chars (v3/v4 OpenPGP keys).

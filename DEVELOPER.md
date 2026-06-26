@@ -407,28 +407,35 @@ gossip_task (background, every 60s):
 ### `nullnode-client` — CLI entry point
 
 ```rust
-cmd_init(config)       // Generate identity
-cmd_id(config)         // Show Null ID + fingerprint
-cmd_export()           // Print armored public key
-cmd_import(armored)    // Import from file or stdin
-cmd_contacts()         // List registered contacts
-cmd_add_contact(nid, fp) // Add a contact with fingerprint
-cmd_send(nid, msg)     // Send message to peer (DHT lookup + P2P delivery)
-cmd_read()             // Read messages from relay mailbox
-cmd_listen(config)     // Start P2P listener for incoming connections
-cmd_chat(nid)          // Interactive P2P chat
-cmd_verify(nid)        // Verify contact safety number (G6)
-cmd_safety_number(nid) // Show safety number for a contact (G6)
-cmd_status()           // Show DHT status
+cmd_init(config)          // Generate identity
+cmd_id(config)            // Show Null ID + fingerprint
+cmd_export()              // Print armored public key
+cmd_import(armored)       // Import from file or stdin
+cmd_contacts()            // List registered contacts
+cmd_add_contact(nid, fp)  // Add a contact with fingerprint
+cmd_alias(name, nid)      // Assign human-readable alias to a Null ID
+cmd_aliases()             // List all aliases
+cmd_send(nid_or_alias, msg) // Send message to peer (DHT lookup + P2P delivery)
+cmd_read()                // Read messages from relay mailbox
+cmd_listen(config)        // Start P2P listener for incoming connections
+cmd_chat(nid_or_alias)    // Interactive P2P chat
+cmd_verify(nid_or_alias)  // Verify contact safety number (G6)
+cmd_safety_number(nid_or_alias) // Show safety number for a contact (G6)
+cmd_status()              // Show DHT status
 ```
+
+**Alias resolution:**
+
+The client uses `resolve_recipient(input, aliases)` to map user-provided recipients (in `send`, `chat`, `verify`, `safety-number`) to Null IDs. If the input matches a known alias, it returns the mapped Null ID; otherwise it passes the input through unchanged. This means raw Null IDs always work.
 
 **Configuration paths:**
 
 | Path | Purpose |
 |---|---|
-| `~/.nullnode/identity.json` | Own Null ID + fingerprint |
-| `~/.nullnode/contacts.json` | NID -> fingerprint mapping |
-| `~/.nullnode/pin_cache.json` | DHT address TOFU pins |
+|| `~/.nullnode/identity.json` | Own Null ID + fingerprint |
+|| `~/.nullnode/contacts.json` | NID -> fingerprint mapping |
+|| `~/.nullnode/aliases.json` | Alias -> NID mapping (human-readable names) |
+|| `~/.nullnode/pin_cache.json` | DHT address TOFU pins |
 | `~/.nullnode/bootstrap_pin_cache.json` | Bootstrap TLS cert TOFU pins |
 | `~/.nullnode/dht_store.db` | SQLite DHT storage |
 | `~/.nullnode/messages.db` | SQLite message store (AES-256-GCM encrypted) |
@@ -443,10 +450,30 @@ cmd_status()           // Show DHT status
 ### `nullnode-bootstrap` — Bootstrap DHT server
 
 ```rust
-// CLI: --host, --port, --id, --db
+// CLI: --host, --port, --id, --db, --advertised-url
 // Starts a DHT WebSocket server on the specified port
 // Stores data in SQLite at the specified path
+// --advertised-url sets the public URL (wss://...) when behind nginx
 ```
+
+#### Nginx TLS Proxy Deployment
+
+For production, run the bootstrap behind nginx on :443:
+
+```bash
+# Bootstrap binds to localhost only — nginx terminates TLS
+./target/release/nullnode-bootstrap \
+    --host 127.0.0.1 --port 9001 \
+    --advertised-url wss://bootstrap.example.com/ws
+```
+
+The `--advertised-url` flag sets `NodeConfig.advertised_url`, which the DHT node
+uses as its public address in DHT records instead of `host:port`. Clients
+discovering this node via DHT will connect through the nginx proxy using
+`wss://` (TLS 1.3).
+
+See `docs/nginx-proxy.md` for the full nginx configuration including WebSocket
+upgrade headers, fallback static page, and rate limiting.
 
 ---
 
