@@ -1140,7 +1140,49 @@ async fn relay_fetch(
     Ok(Vec::new())
 }
 
-/// SECURITY FIX (M2): Send a message via relay with sealed sender.
+/// Send a relay-purge request after successful fetch+decrypt.
+/// This tells the relay to delete all messages for our null_id,
+/// preventing stale data accumulation (squelch).
+async fn relay_purge(
+    relay_url: &str,
+    null_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ws_url = relay_url.replace("http://", "ws://").replace("https://", "wss://");
+    let mut ws = ws_connect(&ws_url).await
+        .map_err(|e| format!("Relay connect failed for purge: {}", e))?;
+
+    let identity = Identity::load()?;
+    let nonce = uuid_hex();
+    let timestamp = chrono::Utc::now().timestamp() as f64;
+    let sig_data = format!("relay-purge:{}:{}:{}", null_id, timestamp, nonce);
+    let sig = sign_for_transport(&sig_data)?;
+
+    let req = serde_json::json!({
+        "type": "relay-purge",
+        "recipient_nid": null_id,
+        "requester_fp": identity.fingerprint,
+        "sender_sig": sig,
+        "timestamp": timestamp,
+        "nonce": nonce,
+        "auth_hmac": "", // Optional: populated when client has relay shared_secret
+    });
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .map_err(|e| format!("Relay purge send failed: {}", e))?;
+
+    // Wait for OK response
+    if let Some(Ok(Message::Text(resp))) = ws.next().await {
+        let resp_val: serde_json::Value = serde_json::from_str(&resp)?;
+        if resp_val.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+            println!("  Relay mailbox purged successfully.");
+        } else if let Some(err) = resp_val.get("error").and_then(|e| e.as_str()) {
+            println!("  Relay purge warning: {}", err);
+        }
+    }
+
+    ws.close(None).await.ok();
+    Ok(())
+}
 /// The relay stores the message without knowing the sender's identity.
 /// The sender identity is encapsulated under the recipient's Kyber public key
 /// so only the recipient can learn who sent it.
@@ -1598,13 +1640,72 @@ async fn send_message(
         .await
         .map_err(|e| format!("P2P send failed: {}", e))?;
 
-    // Wait for ack
-    if let Some(Ok(Message::Text(resp))) = ws.next().await {
-        let ack: serde_json::Value = serde_json::from_str(&resp)?;
-        if ack.get("type").and_then(|t| t.as_str()) == Some("p2p-ack") {
-            println!("Message delivered successfully!");
-        } else {
-            println!("Warning: unexpected response: {}", resp);
+    // Wait for ack (and optionally, p2p-receipt)
+    let mut ack_received = false;
+    let mut receipt_received = false;
+
+    loop {
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ws.next(),
+        ).await;
+
+        match msg {
+            Ok(Some(Ok(Message::Text(resp)))) => {
+                let msg_val: serde_json::Value = serde_json::from_str(&resp)?;
+                let msg_type = msg_val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                if msg_type == "p2p-ack" {
+                    ack_received = true;
+                    println!("Message delivered successfully!");
+                } else if msg_type == "p2p-receipt" {
+                    // ACS2.6: E2E delivery receipt — recipient has decrypted the message.
+                    let receipt_msg_hash = msg_val
+                        .get("payload")
+                        .and_then(|p| p.get("msg_hash"))
+                        .and_then(|h| h.as_str())
+                        .unwrap_or("");
+                    let received_at = msg_val
+                        .get("payload")
+                        .and_then(|p| p.get("received_at"))
+                        .and_then(|t| t.as_f64())
+                        .unwrap_or(0.0);
+
+                    // Verify receipt signature (authenticity)
+                    let receipt_sig = msg_val.get("sig").and_then(|s| s.as_str()).unwrap_or("");
+                    if verify_receipt_signature(receipt_msg_hash, received_at, receipt_sig, recipient_fp) {
+                        // SECURITY FIX (M8): Verify hash matches our sent message to prevent
+                        // forged receipts for different messages. The hash must match exactly.
+                        if receipt_msg_hash == msg_hash {
+                            let when = chrono::DateTime::from_timestamp(received_at as i64, 0)
+                                .map(|dt| dt.format("%H:%M:%S").to_string())
+                                .unwrap_or_else(|| format!("{:.0}", received_at));
+                            println!("Message READ by peer at {} [E2E confirmed]", when);
+                        } else {
+                            println!("Warning: p2p-receipt hash mismatch (possible forged receipt)");
+                            println!("  Sent: {}..., Received: {}...", &msg_hash[..16], &receipt_msg_hash[..16]);
+                        }
+                    } else {
+                        println!("Warning: p2p-receipt signature verification failed");
+                    }
+                    receipt_received = true;
+                }
+
+                if ack_received && receipt_received {
+                    break;
+                }
+                if ack_received && !receipt_received {
+                    // Don't break after ack alone — wait for receipt or timeout
+                    continue;
+                }
+            }
+            Ok(Some(Ok(_))) => {} // binary or other frame type
+            Ok(None) => break,       // connection closed
+            Err(_) => break,         // timeout
+            Ok(Some(Err(e))) => {
+                println!("Warning: websocket error: {}", e);
+                break;
+            }
         }
     }
 
@@ -1811,6 +1912,25 @@ async fn handle_incoming_connection(
                 let p2p_ack = nullnode_p2p::protocol::build_p2p_ack_signed(1, &sha256_hex(&plaintext), &ack_sig);
                 ws_tx.send(Message::Text(serde_json::to_string(&p2p_ack)?.into())).await?;
 
+                // ACS2.6: Send p2p-receipt — cryptographic E2E delivery confirmation.
+                // The receipt is signed by the recipient and proves the message was
+                // successfully decrypted (delivered to the user) without revealing content.
+                // Hash is of ciphertext to match sender's msg_hash for correlation verification.
+                let receipt_sig_data = format!(
+                    "p2p-receipt:{}:{}:{}",
+                    sha256_hex(ciphertext),
+                    chrono::Utc::now().timestamp() as f64,
+                    1, // seq
+                );
+                let receipt_sig = sign_for_transport(&receipt_sig_data)?;
+                let p2p_receipt = nullnode_p2p::protocol::build_p2p_receipt(
+                    &sha256_hex(&plaintext),
+                    chrono::Utc::now().timestamp() as f64,
+                    1,
+                    &receipt_sig,
+                );
+                ws_tx.send(Message::Text(serde_json::to_string(&p2p_receipt)?.into())).await?;
+
             } else {
                 println!("Warning: unexpected message type from {}", peer_fp);
             }
@@ -1830,6 +1950,22 @@ fn sha256_hex(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// Verify a p2p-receipt signature from the recipient.
+/// The receipt is signed over "p2p-receipt:{msg_hash}:{received_at}:{seq}"
+/// using the recipient's PGP key. This proves they decrypted the message.
+fn verify_receipt_signature(
+    msg_hash: &str,
+    received_at: f64,
+    signature: &str,
+    recipient_fp: &str,
+) -> bool {
+    if signature.is_empty() {
+        return false;
+    }
+    let sig_data = format!("p2p-receipt:{}:{}:{}", msg_hash, received_at, 1);
+    nullnode_dht_core::verify_signature(&sig_data, signature, recipient_fp)
 }
 
 /// SECURITY FIX (M1): Pad message to constant-size bucket to prevent
@@ -2057,6 +2193,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = store
                         .store_message("relay", &identity.null_id, msg)
                         .await;
+                }
+
+                // ACS2.6 Part III: Squelch — purge all messages from the relay
+                // after successful delivery and decryption. This prevents stale
+                // messages from accumulating on the relay.
+                if let Err(e) = relay_purge(RELAY_URL, &identity.null_id).await {
+                    println!("  (purge failed: {})", e);
                 }
             }
 

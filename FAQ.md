@@ -113,6 +113,52 @@ If you prefer not to set a passphrase, press Enter at the prompt — the key wil
 
 ---
 
+## How does message delivery work?
+
+NullNode uses a two-tier delivery system: **direct P2P** when the recipient is online, and **relay mailbox** when they're offline.
+
+### Direct P2P delivery (primary)
+
+When you send a message:
+
+1. The recipient's address is looked up in the DHT (bootstrap seed).
+2. A direct WebSocket connection is established to the recipient's P2P listener.
+3. A handshake exchanges Kyber-1024 public keys and proves identity via GPG signatures.
+4. Messages are encrypted with the Double Ratchet algorithm (ML-KEM + AES-256-GCM) and sent directly.
+5. The recipient decrypts immediately and sends back two confirmations:
+   - `p2p-ack` — transport-level confirmation (message received)
+   - `p2p-receipt` — cryptographic E2E confirmation (message decrypted and read)
+
+You see `"Message delivered successfully!"` on ack, and `"Message READ by peer at HH:MM:SS [E2E confirmed]"` on receipt.
+
+### Relay mailbox (fallback)
+
+If the recipient is offline or unreachable via P2P, the message is stored encrypted on the relay:
+
+1. The sender stores the encrypted message in the recipient's relay mailbox.
+2. When the recipient comes online and runs `nullnode read`, the client fetches all stored messages.
+3. Messages are decrypted using the persisted Double Ratchet session.
+4. After successful fetch and decryption, the client sends a `relay-purge` command to delete all messages from the mailbox. This prevents stale ciphertext from accumulating.
+
+### Delivery confirmation levels
+
+| Level | What it proves | How it's verified |
+|---|---|---|
+| Relay stored | Message reached the relay | Relay returns `"ok"` |
+| P2P ack | Message reached the peer over WebSocket | Signed `p2p-ack` received |
+| P2p-receipt | Peer decrypted the message | Signed `p2p-receipt` with recipient's GPG key |
+
+### Edge-core relay mode
+
+Relays can run in two modes:
+
+- **Core mode** (`--allow-relay`): accepts and forwards messages between other relays (federation transit). This is the default for server-side relays.
+- **Edge mode** (default, no `--allow-relay`): only serves its own local mailboxes. Refuses to forward messages on behalf of other relays. This is appropriate for mobile or battery-powered nodes running a local relay.
+
+Edge mode prevents mobile nodes from being used as transit points in the relay federation, saving battery and bandwidth.
+
+---
+
 ## Documentation
 
 - **[README.md](README.md)** — Project overview and quick start

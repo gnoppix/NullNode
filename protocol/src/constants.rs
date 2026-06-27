@@ -93,3 +93,5 @@ pub const MSG_RELAY_REGISTERED: &str = "registered";
 pub const MSG_RELAY_SEND: &str = "send";
 pub const MSG_RELAY_RECV: &str = "recv";
 pub const MSG_RELAY_ACK: &str = "ack";
+pub const MSG_RELAY_PURGE: &str = "relay-purge";
+pub const MSG_P2P_RECEIPT: &str = "p2p-receipt";

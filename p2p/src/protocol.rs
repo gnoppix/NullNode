@@ -229,6 +229,41 @@ pub fn build_p2p_ping() -> nullnode_protocol::envelope::WireEnvelope {
     }
 }
 
+/// P2P receipt payload — cryptographic E2E delivery confirmation.
+/// The recipient signs this after successfully decrypting a message,
+/// proving to the sender that the message was delivered and read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2pReceipt {
+    pub msg_hash: String,
+    /// Epoch timestamp when the message was decrypted.
+    pub received_at: f64,
+    /// Sequence number of the original message.
+    pub seq: i64,
+}
+
+/// Build a p2p-receipt wire envelope.
+/// The signature is computed over "p2p-receipt:{msg_hash}:{received_at}:{seq}"
+/// by the recipient and proves delivery without revealing content.
+pub fn build_p2p_receipt(
+    msg_hash: &str,
+    received_at: f64,
+    seq: i64,
+    signature: &str,
+) -> nullnode_protocol::envelope::WireEnvelope {
+    use nullnode_protocol::envelope::WireEnvelope;
+    WireEnvelope {
+        msg_type: constants::MSG_P2P_RECEIPT.to_string(),
+        payload: serde_json::json!({
+            "msg_hash": msg_hash,
+            "received_at": received_at,
+            "seq": seq,
+        }),
+        msg_id: crate::util::uuid_hex(),
+        ts: crate::util::now_unix(),
+        sig: signature.to_string(),
+    }
+}
+
 /// Build a p2p-pong wire envelope.
 pub fn build_p2p_pong() -> nullnode_protocol::envelope::WireEnvelope {
     use nullnode_protocol::envelope::WireEnvelope;

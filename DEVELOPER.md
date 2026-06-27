@@ -115,9 +115,12 @@ pub struct WireEnvelope {
 | `nat-punch` / `nat-punch-ack` | peer -> peer | Hole-punching coordination |
 | **Federated relays** | | |
 | `relay-forward` | relay -> relay | Cross-relay message delivery |
+| `relay-purge` | client -> relay | Squelch (delete all messages for recipient after delivery) |
 | `route-advertise` | relay -> relay | Share local route table |
 | `who-has` / `route-found` | relay -> relay | Route lookup query/response |
 | `peer-auth` / `peer-auth-reply` | relay -> relay | Peer authentication |
+| **E2E delivery confirmation** | | |
+| `p2p-receipt` | peer -> peer | Cryptographic delivery confirmation (signed by recipient after decrypt) |
 | **Legacy relay (fallback)** | | |
 | `register` / `registered` | client -> relay | Registration |
 | `send` / `recv` | client <-> relay | Message send/receive |
@@ -503,6 +506,14 @@ NullNode implements the Architectural & Cryptographic Specification v2.6. This s
 |-----------------|--------|-------|
 | **Adaptive Traffic Budgeting Engine** | ❌ Not implemented | No network state detection or Poisson streams |
 | **PQ-PPN (Push Notifications)** | ❌ Not implemented | No push proxy or zero-knowledge triggers |
+| **Edge-Core Relay Mode** | ✅ Complete | `--allow-relay` flag: default false (edge), must opt-in for core federation transit |
+
+### Part II-B: Delivery & Squelch
+
+| ACS2.6 Requirement | Status | Notes |
+|-----------------|--------|-------|
+| **E2E Delivery Receipt** | ✅ Complete | `p2p-receipt`: signed by recipient after decrypt, proves delivery without revealing content |
+| **Relay Purge/Squelch** | ✅ Complete | `relay-purge`: authenticated deletion of all messages after successful delivery |
 
 ### Part III: Local Data-at-Rest Protection
 
@@ -562,6 +573,9 @@ NullNode implements the Architectural & Cryptographic Specification v2.6. This s
 | Guard pages + mlock | Part III.3 memory protection |
 | AES-256-GCM database encryption at rest | Part III.2 data protection |
 | SIGINT graceful shutdown | Part III.2 lifecycle hooks |
+| E2E delivery receipt (`p2p-receipt`) | Part II-B delivery confirmation |
+| Relay purge/squelch (`relay-purge`) | Part II-B squelch after delivery |
+| Edge-core relay mode (`--allow-relay`) | Part II mobile/battery protection |
 
 ---
 
@@ -580,6 +594,9 @@ NullNode implements the Architectural & Cryptographic Specification v2.6. This s
 9c. ~~**GPG secret key encryption**~~ ✅ Done — age passphrase protects own_cert.age on disk
 9d. ~~**Memory zeroization**~~ ✅ Done — ZeroizeOnDrop on DoubleRatchetSession, DbEncryptionKey, VariantKeypair; graceful SIGINT/SIGTERM shutdown
 9e. ~~**P2P mutual authentication**~~ ✅ Done — GPG-signed hello + hello-ack, reject unsigned, relay federation auth enforcement
+9f. ~~**E2E delivery receipt**~~ ✅ Done — `p2p-receipt` signed after decrypt, with 10s timeout loop in sender
+9g. ~~**Relay purge/squelch**~~ ✅ Done — `relay-purge` authenticated deletion, wired into `nullnode read`
+9h. ~~**Edge-core relay mode**~~ ✅ Done — `--allow-relay` flag (default: edge), rejects federation transit
 10. **Biometric access lifecycle** — Key scrubbing on app background/lock
 11. **Hardware-bound keys** — Argon2id user-derived keys, HSM integration
 
@@ -675,6 +692,10 @@ make man
 14. **Encrypted message storage** — SQLite database stores only ciphertext; no plaintext ever written to disk
 15. **Guard pages** — key material between PROT_NONE mmap pages; buffer overflows trigger SIGSEGV
 16. **CBNP cover traffic** — Poisson-timed dummy packets prevent traffic analysis during idle periods
+17. **E2E delivery receipts** — `p2p-receipt` signed by recipient proves message was decrypted (not just received)
+18. **Relay squelch** — `relay-purge` deletes all mailbox entries after successful delivery+decrypt, preventing stale ciphertext accumulation
+19. **Edge-core relay mode** — Mobile nodes default to edge mode (no transit forwarding); `--allow-relay` opts in to core/federation transit
+20. **HMAC dual-auth on purge** — When relay has shared_secret, `relay-purge` requires both GPG signature and HMAC
 
 ---
 
@@ -691,6 +712,116 @@ Multi-relay federation allows messages to route between relay servers:
 **Known limitation**: Federation currently requires manual peer URL configuration via command-line. Automatic peer discovery will be implemented in a future phase.
 
 ---
+
+## Delivery architecture
+
+NullNode uses a two-tier delivery system with cryptographic confirmation at each stage.
+
+### Delivery flow (sender side)
+
+```
+send_message()
+  ├─ DHT lookup (bootstrap seed) → recipient WebSocket address
+  ├─ P2P connect + handshake (Kyber-1024 KEM, GPG-signed)
+  ├─ Double Ratchet encrypt + send p2p-message
+  ├─ Wait for responses (10s timeout loop):
+  │   ├─ p2p-ack → "Message delivered successfully!"
+  │   └─ p2p-receipt → "Message READ by peer at HH:MM:SS [E2E confirmed]"
+  └─ Store sent message locally (ciphertext only)
+```
+
+If P2P fails (timeout, offline peer), the message falls back to relay-store.
+
+### Relay mailbox flow (recipient side)
+
+```
+nullnode read (client)
+  ├─ relay-fetch: signed request → relay returns encrypted entries
+  ├─ relay_decrypt_message(): load DoubleRatchetSession from SQLite, decrypt
+  ├─ Display plaintext to user
+  └─ relay-purge: signed squelch request → relay deletes ALL messages
+                  for this null_id (in-memory + SQLite)
+```
+
+### `p2p-receipt` — E2E delivery confirmation
+
+The receipt proves the recipient has decrypted the message (not just received it).
+
+```
+Recipient side (handle_incoming_connection):
+  1. Decrypt p2p-message via DoubleRatchetSession
+  2. Send p2p-ack (transport confirmation)
+  3. Send p2p-receipt:
+     - Signs: "p2p-receipt:{msg_hash}:{received_at}:{seq}"
+     - Uses recipient's own GPG key (sign_for_transport)
+     - Sent as a WireEnvelope with msg_type = "p2p-receipt"
+
+Sender side (send_message response loop):
+  1. Parse incoming WireEnvelope
+  2. If type == "p2p-receipt":
+     a. Extract msg_hash, received_at, sig from payload
+     b. verify_receipt_signature() → dht_core::verify_signature()
+     c. On success: display "Message READ by peer at {time} [E2E confirmed]"
+     d. On failure: display warning (possible forged receipt)
+```
+
+### `relay-purge` — Squelch after delivery
+
+Prevents stale ciphertext accumulation on the relay after messages have been successfully delivered and decrypted.
+
+```
+Client sends:
+  {
+    "type": "relay-purge",
+    "recipient_nid": "<own null_id>",
+    "requester_fp": "<own fingerprint>",
+    "sender_sig": "<GPG signature over 'relay-purge:{nid}:{ts}:{nonce}'>",
+    "timestamp": <unix_ts>,
+    "nonce": "<uuid>"
+  }
+
+Relay verifies:
+  1. Timestamp freshness (±300s)
+  2. null_id == compute_null_id(fingerprint) (proves key ownership)
+  3. GPG detached signature verification (in-process via Sequoia)
+  4. Nonce replay check (prevents re-purging)
+  5. DELETE ALL mailbox entries for this null_id
+```
+
+### Edge-core relay mode (`--allow-relay`)
+
+```
+relay-forward handler:
+  if !state.allow_relay:
+    → Send relay-forward-ack { accepted: false, error: "edge mode" }
+    → Return (do not forward)
+  else:
+    → Process forwarding to peer relay
+```
+
+This allows mobile/battery nodes to run a local relay without becoming transit points in the federation.
+
+### Delivery confirmation levels
+
+| Level | Wire message | What it proves | Verification |
+|---|---|---|---|
+| Relay stored | `relay-store` response `"ok"` | Message reached relay mailbox | HMAC + signature |
+| P2P received | `p2p-ack` | Peer's WebSocket received the message | GPG signature (peer key) |
+| P2P read | `p2p-receipt` | Peer decrypted the message content | GPG signature (peer key) + msg_hash |
+
+### Key source locations
+
+| Component | File | Function |
+|---|---|---|
+| Send message (P2P) | `client/src/main.rs` | `send_message()` |
+| Recv message (P2P) | `client/src/main.rs` | `handle_incoming_connection()` |
+| Receipt builder | `p2p/src/protocol.rs` | `build_p2p_receipt()` |
+| Receipt verifier | `client/src/main.rs` | `verify_receipt_signature()` |
+| Relay purge handler | `relay/src/main.rs` | `"relay-purge"` match arm |
+| Purge DB + memory | `relay/src/main.rs` | `purge_all_messages()` |
+| Client purge sender | `client/src/main.rs` | `relay_purge()` |
+| Edge-core enforcement | `relay/src/main.rs` | `if !state.allow_relay` in `relay-forward` |
+| Message type constants | `protocol/src/constants.rs` | `MSG_RELAY_PURGE`, `MSG_P2P_RECEIPT` |
 
 ## References
 

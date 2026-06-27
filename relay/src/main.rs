@@ -433,13 +433,16 @@ struct RelayState {
     cert_cache: RwLock<HashMap<String, String>>,
     /// ACS2.6 Part IV.2: TOFU-pinned peer certificate fingerprints.
     known_peers: RwLock<HashSet<String>>,
+    /// ACS2.6 Part II.1: Whether this relay allows transit forwarding.
+    /// When false, relay-forward requests are rejected (edge/mobile mode).
+    allow_relay: bool,
 }
 
 impl RelayState {
     /// Initialize relay state with optional SQLite persistence.
     /// SECURITY FIX (C5): Mailbox entries are stored in SQLite encrypted at rest
     /// using DbEncryptionKey. This ensures messages survive relay restart.
-    async fn new(shared_secret: Option<String>, gpg_home: String, db_path: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(shared_secret: Option<String>, gpg_home: String, db_path: Option<String>, allow_relay: bool) -> Result<Self, Box<dyn std::error::Error>> {
         // Load known peers from disk if available
         let known_peers = Self::load_known_peers_sync(&gpg_home);
 
@@ -519,6 +522,7 @@ impl RelayState {
             federation: RwLock::new(FederationState::new(shared_secret)),
             cert_cache: RwLock::new(HashMap::new()),
             known_peers: RwLock::new(known_peers),
+            allow_relay,
         })
     }
 
@@ -771,6 +775,28 @@ impl RelayState {
             )
             .bind(recipient_nid)
             .bind(seq)
+            .execute(pool)
+            .await;
+        }
+    }
+
+    /// ACS2.6 Part III: Purge all messages for a recipient (squelch).
+    /// Called after the recipient has successfully fetched and decrypted
+    /// their messages, proving delivery. Removes both in-memory and
+    /// persistent copies to prevent stale data accumulation.
+    async fn purge_all_messages(&self, recipient_nid: &str) {
+        // In-memory purge
+        {
+            let mut mailboxes = self.mailboxes.write().await;
+            mailboxes.remove(recipient_nid);
+        }
+
+        // SQLite purge
+        if let Some(ref pool) = self.db_pool {
+            let _ = sqlx::query(
+                "DELETE FROM mailbox_entries WHERE recipient_nid = ?"
+            )
+            .bind(recipient_nid)
             .execute(pool)
             .await;
         }
@@ -1383,6 +1409,29 @@ async fn handle_message(
             Ok(())
         }
         "relay-forward" => {
+            // ACS2.6 Part II.1: Edge-core mode — reject transit forwarding
+            // if this relay is not configured as a core node.
+            if !state.allow_relay {
+                let ack = RelayForwardAck {
+                    accepted: false,
+                    error: Some("relay does not accept transit forwarding (edge mode)".to_string()),
+                };
+                let ack_env = RelayEnvelope {
+                    msg_type: "relay-forward-ack".to_string(),
+                    payload: serde_json::json!({
+                        "accepted": ack.accepted,
+                        "error": ack.error,
+                    }),
+                    msg_id: uuid_hex(),
+                    ts: now_unix(),
+                };
+                let json = serde_json::to_string(&ack_env).map_err(|e| e.to_string())?;
+                if let Err(e) = ws.send(Message::Text(tokio_tungstenite::tungstenite::Utf8Bytes::from(json))).await {
+                tracing::warn!("websocket send error: {}", e);
+            }
+                return Ok(());
+            }
+
             let forward: RelayForward = serde_json::from_value(env.payload.clone())
                 .map_err(|e| format!("invalid relay-forward: {}", e))?;
 
@@ -1502,6 +1551,88 @@ async fn handle_message(
             if let Err(e) = ws.send(Message::Text(tokio_tungstenite::tungstenite::Utf8Bytes::from(json))).await {
                 tracing::warn!("websocket send error: {}", e);
             }
+            Ok(())
+        }
+        "relay-purge" => {
+            // ACS2.6 Part III: Squelch — authenticated deletion of all
+            // messages for a recipient after they have been successfully
+            // delivered and decrypted. The requester must prove ownership
+            // of the identity via a GPG signature.
+
+            let purge_recipient = env
+                .payload
+                .get("recipient_nid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let purge_fp = env
+                .payload
+                .get("requester_fp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let purge_sig = env
+                .payload
+                .get("sender_sig")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let purge_ts = env
+                .payload
+                .get("timestamp")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let purge_nonce = env
+                .payload
+                .get("nonce")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // SECURITY FIX (M8): If shared_secret is configured, require HMAC authentication
+            // in addition to GPG signature. This provides two-factor auth for federation purges.
+            if let Some(ref secret) = state.shared_secret {
+                let auth_hmac = env
+                    .payload
+                    .get("auth_hmac")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let hmac_data = format!("relay-purge:{}:{}", purge_recipient, purge_ts);
+                if !verify_hmac(&hmac_data, auth_hmac, secret) {
+                    return Err("purge denied: HMAC verification failed".to_string());
+                }
+            }
+
+            if purge_fp.is_empty() || purge_sig.is_empty() {
+                return Err("purge: missing requester fingerprint or signature".to_string());
+            }
+
+            state.check_timestamp_freshness(purge_ts)?;
+
+            let computed_nid = nullnode_dht_core::compute_null_id(&purge_fp);
+            if computed_nid != purge_recipient {
+                return Err("purge denied: null_id does not match requester fingerprint".to_string());
+            }
+
+            let sig_data = format!(
+                "relay-purge:{}:{}:{}",
+                purge_recipient, purge_ts, purge_nonce
+            );
+            if !verify_gpg_detached(&purge_sig, &sig_data, &purge_fp, &state.cert_cache)
+                .unwrap_or(false)
+            {
+                return Err("purge denied: GPG signature verification failed".to_string());
+            }
+
+            let nonce_hash = format!("purge:{}:{}", purge_fp, purge_nonce);
+            if !state.check_and_record_nonce_str(&purge_fp, &nonce_hash).await {
+                return Err("replay detected: nonce already seen".to_string());
+            }
+
+            // Delete all messages for this recipient
+            state.purge_all_messages(&purge_recipient).await;
+            tracing::info!(recipient = %purge_recipient, fp = %purge_fp, "purge: all messages deleted");
+            send_ok(ws, None).await;
             Ok(())
         }
         "onion-v1" => {
@@ -1932,6 +2063,14 @@ struct Args {
     /// network traffic profile, preventing traffic analysis during idle periods.
     #[arg(long, default_value_t = true)]
     cbnp_enabled: bool,
+
+    /// ACS2.6 Part II.1: Edge-core mode — allow this relay to forward transit messages.
+    /// When false (default), this relay only stores messages for locally registered
+    /// recipients and refuses relay-forward requests. This is appropriate for mobile
+    /// or battery-powered nodes that should not relay traffic for others.
+    /// Set to true for dedicated server relays.
+    #[arg(long, default_value_t = false)]
+    allow_relay: bool,
 }
 
 #[tokio::main]
@@ -1995,7 +2134,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let db_path = format!("{}/mailbox.db", gpg_home);
-    let state = Arc::new(RelayState::new(shared_secret.clone(), gpg_home, Some(db_path)).await?);
+    let allow_relay = args.allow_relay;
+    let state = Arc::new(RelayState::new(shared_secret.clone(), gpg_home, Some(db_path), allow_relay).await?);
     {
         let mut fed = state.federation.write().await;
         fed.our_url = Some(our_url.clone());
