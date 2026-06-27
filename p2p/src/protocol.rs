@@ -23,6 +23,14 @@ pub struct P2pHello {
     /// Kyber-768 public key (base64 encoded, 1184 bytes raw)
     /// Used for post-quantum key exchange
     pub kyber_enc_key: String,
+    /// SECURITY FIX (M2): Sealed sender identity (optional).
+    /// When present, this is a hex-encoded Kyber-768 ciphertext that encapsulates
+    /// `{sender_nid}|{sender_fp}|{sender_kyber_fp}` under the recipient's
+    /// Kyber public key (obtained from DHT/contact lookup).
+    /// The recipient decapsulates this with their Kyber private key to learn
+    /// who is connecting. The `public_key` field is then a one-time commitment
+    /// (SHA-256 of the ephemeral key) rather than the real GPG fingerprint.
+    pub sealed_identity: String,
 }
 
 /// P2P hello-ack message payload.
@@ -57,26 +65,13 @@ pub struct P2pAck {
 
 /// Build a p2p-hello wire envelope.
 /// SECURITY FIX (C1): Include Kyber public key for post-quantum key exchange.
-/// SECURITY FIX (C2): Sign the hello to authenticate the initiator.
-pub fn build_p2p_hello_signed(
-    public_key_b64: &str,
-    nonce: u64,
-    pow_bits: u32,
-    kyber_enc_key_b64: &str,
-    signature: &str,
-) -> nullnode_protocol::envelope::WireEnvelope {
-    let mut env = build_p2p_hello(public_key_b64, nonce, pow_bits, kyber_enc_key_b64);
-    env.sig = signature.to_string();
-    env
-}
-
-/// Build a p2p-hello wire envelope.
-/// SECURITY FIX (C1): Include Kyber public key for post-quantum key exchange.
+/// SECURITY FIX (M2): Include sealed_identity for sender anonymity.
 pub fn build_p2p_hello(
     public_key_b64: &str,
     nonce: u64,
     pow_bits: u32,
     kyber_enc_key_b64: &str,
+    sealed_identity: &str,
 ) -> nullnode_protocol::envelope::WireEnvelope {
     use nullnode_protocol::envelope::WireEnvelope;
     WireEnvelope {
@@ -86,11 +81,29 @@ pub fn build_p2p_hello(
             "nonce": nonce,
             "pow_bits": pow_bits,
             "kyber_enc_key": kyber_enc_key_b64,
+            "sealed_identity": sealed_identity,
         }),
         msg_id: crate::util::uuid_hex(),
         ts: crate::util::now_unix(),
         sig: String::new(),
     }
+}
+
+/// Build a signed p2p-hello wire envelope.
+/// SECURITY FIX (C1): Include Kyber public key for post-quantum key exchange.
+/// SECURITY FIX (C2): Sign the hello to authenticate the initiator.
+/// SECURITY FIX (M2): Include sealed_identity for sender anonymity.
+pub fn build_p2p_hello_signed(
+    public_key_b64: &str,
+    nonce: u64,
+    pow_bits: u32,
+    kyber_enc_key_b64: &str,
+    sealed_identity: &str,
+    signature: &str,
+) -> nullnode_protocol::envelope::WireEnvelope {
+    let mut env = build_p2p_hello(public_key_b64, nonce, pow_bits, kyber_enc_key_b64, sealed_identity);
+    env.sig = signature.to_string();
+    env
 }
 
 /// Build a p2p-hello-ack wire envelope.

@@ -1,9 +1,63 @@
 # Changelog
 
+## 0.2.7 — Relay Mailbox Persistence (2026-06-26)
+
+### Security fixes
+- **Relay mailbox persistence (C5)** — Relay now stores mailbox entries in SQLite (`mailbox.db`, 0o600). Messages survive relay restart instead of being lost on process exit. Each row stores opaque ciphertext blobs (already encrypted by sender via DoubleRatchet), so stored data is always encrypted. In-memory cache preserved for fast reads; SQLite is source of truth.
+
+### Test coverage
+- All 12 relay tests pass (unchanged behavior — SQLite is additive)
+
+## 0.2.6 — P2P Handshake Authentication & Relay Federation Enforcement (2026-06-26)
+
+### Security fixes
+- **P2P initiator: verify hello-ack GPG signature** — Previously the initiator signed its hello but never verified the responder's hello-ack. An active MITM could inject a fake hello-ack with their own Kyber key. Now the initiator MUST verify the ack signature and rejects connections with unsigned acks.
+- **P2P responder: reject unsigned hellos** — Changed from TOFU-warn to hard reject. Any peer sending a hello without a GPG signature is now disconnected.
+- **Relay federation: enforce peer authentication** — `relay-forward` messages now check `peer.authenticated` before accepting. If `shared_secret` is configured, unauthenticated peers get rejected with an error ACK.
+- **RelayForward struct: added source_relay_url field** — Receiving relay can now look up the sender's authentication state. Backward compatible (`#[serde(default)]` — older senders get empty string).
+- **forward_to_peer: auto-set source_relay_url** — When forwarding, our URL is set so the receiving relay can authenticate us.
+
+### Test coverage
+- `test_source_relay_url_defaults_empty` — verifies backward-compatible deserialization
+- Updated `test_relay_forward_loop_detection` to include the new field
+
+## 0.2.5 — Memory Zeroization of Secret Buffers (2026-06-26)
+
+### Security fixes
+- **DoubleRatchetSession: ZeroizeOnDrop** — `root_key`, `send_chain_key`, `recv_chain_key` now automatically zeroed when session is dropped. Uses `#[zeroize(skip)]` on non-sensitive metadata (fingerprints, sequence numbers).
+- **VariantKeypair: ZeroizeOnDrop** — `dec_bytes` (private key seed) zeroed on drop. `variant` and `enc_bytes` (public) skipped.
+- **MlKem1024Keypair: automatic zeroization** — `DecapsulationKey` already implements `ZeroizeOnDrop` from ml-kem crate; drop glue clears it when keypair is dropped.
+- **DbEncryptionKey: ZeroizeOnDrop** — SQLite encryption key zeroed when `MessageStore` is dropped.
+- **Signal handler fix** — SIGINT/SIGTERM now triggers graceful shutdown (allowing Drop impls to run) instead of `std::process::exit(0)` which bypassed zeroization. Added SIGTERM handler for systemd integration.
+
+### Dependencies
+- Added `zeroize` (with derive feature) to client crate.
+
+## 0.2.4 — GPG Secret Key Encryption at Rest (2026-06-26)
+
+### New features
+- **GPG secret key encryption**: `own_cert.age` stores the Sequoia secret key encrypted with age passphrase encryption (scrypt recipient + XChaCha20-Poly1305 AEAD)
+- `generate_identity` prompts for a passphrase during `nullnode init` (no-echo via `rpassword`); encrypted key written as `~/.nullnode/gnupg/own_cert.age` (0o600)
+- Empty passphrase = legacy plaintext (`own_cert.asc`) — backward compatible opt-out
+- `load_cert` tries `own_cert.age` first (prompts for password via `rpassword`), falls back to `own_cert.asc` for existing plaintext installs
+- Re-running `nullnode init` with a passphrase removes the old plaintext `own_cert.asc`
+
+### Dependencies
+- `age 0.11` (pure Rust, scrypt + XChaCha20-Poly1305)
+- `rpassword 7` (cross-platform no-echo TTY password input)
+
+## 0.2.3 — DoubleRatchet Session Persistence & Relay Decryption (2026-06-26)
+
+### New features
+- **P2P session persistence**: DoubleRatchet sessions are now saved to the SQLite message store (`ratchet_sessions` table) after creation in both `send_message` and `handle_incoming_connection`
+- **Relay message decryption**: `relay_fetch` now decrypts offline messages using persisted DoubleRatchet sessions instead of returning raw ciphertext blobs
+- `relay_decrypt_message` parses the relay's `signed_blob` as a `WireEnvelope`, loads the session by sender NID, decrypts the ciphertext, and re-saves updated session state
+- Sessions keyed by peer Null ID for both send and receive paths
+
 ## 0.2.2 — Nginx TLS Proxy & WSS Support (2026-06-26)
 
 ### New features
-- **WssThe smartest implementation here is simpler than the blueprint. You want nginx on :443 terminating TLS, so the bootstrap server stays plaintext on localhost. Three actual code changes needed:
+- **WSS/TLS support**: The smartest implementation here is simpler than the blueprint. You want nginx on :443 terminating TLS, so the bootstrap server stays plaintext on localhost. Three actual code changes needed:
 
 1. **Client wss:// support** — `dht_lookup` and `relay_fetch` currently do `https:// → wss://` string replacement but then connect with plaintext TCP. Now they actually do TLS.
 2. **Bootstrap `--advertised-url`** — when behind nginx, the DHT records must advertise `wss://public-domain` instead of `ws://localhost:9001`.

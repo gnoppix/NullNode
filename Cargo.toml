@@ -31,6 +31,9 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 sequoia-openpgp = "2"
 futures = "0.3"
 zeroize = { version = "1", features = ["zeroize_derive"] }
+age = { version = "0.11", features = ["armor"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
 
 [profile.release]
 opt-level = 3

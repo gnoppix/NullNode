@@ -97,6 +97,22 @@ The relay sees: sender Null ID, receiver Null ID, connection timestamps, and mes
 
 ---
 
+## What happens when I receive a message while offline?
+
+When you're offline, messages are stored encrypted on the relay. When you run `nullnode read`, the client fetches those offline messages and decrypts them using your persisted DoubleRatchet sessions. The session state is updated after decryption, so future messages from the same contact continue to work correctly.
+
+If this is your first conversation and the session was created when the message arrived (e.g., someone sent you a message and you received it via relay before ever connecting directly), the session has already been initialized and decryption works transparently.
+
+---
+
+## Is my GPG private key stored safely on disk?
+
+Yes. Starting from v0.2.4, your GPG secret key is encrypted at rest using age passphrase encryption (scrypt + XChaCha20-Poly1305). You set the passphrase during `nullnode init`. On startup, the client prompts you to enter it before the key is decrypted into memory.
+
+If you prefer not to set a passphrase, press Enter at the prompt — the key will be stored as plaintext (previous behavior). Backward compatibility with existing plaintext `own_cert.asc` files is preserved.
+
+---
+
 ## Documentation
 
 - **[README.md](README.md)** — Project overview and quick start

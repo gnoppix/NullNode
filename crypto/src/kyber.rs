@@ -24,6 +24,7 @@ use ml_kem::MlKem1024;
 use ml_kem::MlKem768;
 use ml_kem::TryKeyInit;
 use serde::{Deserialize, Serialize};
+use zeroize::ZeroizeOnDrop;
 
 use base64::Engine;
 
@@ -75,7 +76,9 @@ pub fn decode_enc_key(b64: &str) -> Result<MlKem1024EncapsulationKey, CryptoErro
 }
 
 /// An ML-KEM-1024 keypair for post-quantum key exchange.
-#[derive(Debug, Clone)]
+/// SECURITY FIX (C2): decapsulation key is automatically zeroized on drop
+/// (DecapsulationKey implements ZeroizeOnDrop from ml-kem crate).
+/// No derive needed — drop glue clears dec when MlKem1024Keypair is dropped.
 pub struct MlKem1024Keypair {
     pub enc: MlKem1024EncapsulationKey,
     pub dec: MlKem1024DecapsulationKey,
@@ -107,14 +110,40 @@ impl MlKem1024Keypair {
         Ok(ss)
     }
 
-    /// Save the ML-KEM-1024 keypair to a file (encoded as hex).
-    /// The file is written with 0o600 permissions (owner-only read).
-    pub fn save(&self, path: &std::path::Path) -> Result<(), CryptoError> {
+    /// Save the ML-KEM-1024 keypair to a file with AES-256-GCM encryption.
+    /// SECURITY FIX (C6): The secret key (`dec`) is encrypted at rest using
+    /// AES-256-GCM with a key derived from `encryption_key` via HKDF-SHA256.
+    /// Format (hex JSON): [salt (32 bytes)][nonce (12 bytes)][ciphertext (variable)]
+    /// The public key (`enc`) is stored in plaintext (it is not secret).
+    pub fn save(&self, path: &std::path::Path, encryption_key: &[u8; 32]) -> Result<(), CryptoError> {
+        use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
         let enc_bytes = self.enc.to_bytes();
         let dec_bytes = self.dec.to_bytes();
+
+        // Derive AES-256-GCM key from encryption_key using HKDF-SHA256
+        let hk = Hkdf::<Sha256>::new(None, encryption_key);
+        let mut aes_key = [0u8; 32];
+        hk.expand(b"nullnode-kyber-key-enc-v1", &mut aes_key)
+            .map_err(|_| CryptoError::KeyPersistence("HKDF expand failed".into()))?;
+
+        // Generate random nonce
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+
+        // Encrypt dec_bytes with AES-256-GCM
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
+        let ciphertext = cipher
+            .encrypt(&nonce, dec_bytes.as_slice())
+            .map_err(|e| CryptoError::KeyPersistence(format!("AES-GCM encrypt: {}", e)))?;
+
+        // Assemble: enc_public (plaintext) + nonce + encrypted_dec
         let data = serde_json::json!({
             "enc": hex::encode(enc_bytes),
-            "dec": hex::encode(dec_bytes),
+            "nonce": hex::encode(nonce.as_slice()),
+            "dec_encrypted": hex::encode(ciphertext),
         });
         std::fs::write(path, data.to_string())
             .map_err(|e| CryptoError::KeyPersistence(format!("write failed: {}", e)))?;
@@ -127,8 +156,14 @@ impl MlKem1024Keypair {
         Ok(())
     }
 
-    /// Load an ML-KEM-1024 keypair from a file.
-    pub fn load(path: &std::path::Path) -> Result<Self, CryptoError> {
+    /// Load an ML-KEM-1024 keypair from an encrypted file.
+    /// SECURITY FIX (C6): Decrypts the secret key using AES-256-GCM.
+    pub fn load(path: &std::path::Path, encryption_key: &[u8; 32]) -> Result<Self, CryptoError> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
         let content = std::fs::read_to_string(path)
             .map_err(|e| CryptoError::KeyPersistence(format!("read failed: {}", e)))?;
         let data: serde_json::Value = serde_json::from_str(&content)
@@ -136,13 +171,33 @@ impl MlKem1024Keypair {
         let enc_hex = data["enc"]
             .as_str()
             .ok_or_else(|| CryptoError::KeyPersistence("missing enc field".into()))?;
-        let dec_hex = data["dec"]
+        let nonce_hex = data["nonce"]
             .as_str()
-            .ok_or_else(|| CryptoError::KeyPersistence("missing dec field".into()))?;
+            .ok_or_else(|| CryptoError::KeyPersistence("missing nonce field".into()))?;
+        let dec_encrypted_hex = data["dec_encrypted"]
+            .as_str()
+            .ok_or_else(|| CryptoError::KeyPersistence("missing dec_encrypted field".into()))?;
+
         let enc_bytes = hex::decode(enc_hex)
             .map_err(|e| CryptoError::KeyPersistence(format!("enc hex decode: {}", e)))?;
-        let dec_bytes = hex::decode(dec_hex)
-            .map_err(|e| CryptoError::KeyPersistence(format!("dec hex decode: {}", e)))?;
+        let nonce_bytes = hex::decode(nonce_hex)
+            .map_err(|e| CryptoError::KeyPersistence(format!("nonce hex decode: {}", e)))?;
+        let dec_ciphertext = hex::decode(dec_encrypted_hex)
+            .map_err(|e| CryptoError::KeyPersistence(format!("dec_encrypted hex decode: {}", e)))?;
+
+        // Derive AES-256-GCM key from encryption_key using HKDF-SHA256
+        let hk = Hkdf::<Sha256>::new(None, encryption_key);
+        let mut aes_key = [0u8; 32];
+        hk.expand(b"nullnode-kyber-key-enc-v1", &mut aes_key)
+            .map_err(|_| CryptoError::KeyPersistence("HKDF expand failed".into()))?;
+
+        // Decrypt dec_bytes with AES-256-GCM
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let dec_bytes = cipher
+            .decrypt(nonce, dec_ciphertext.as_slice())
+            .map_err(|e| CryptoError::KeyPersistence(format!("AES-GCM decrypt: {}", e)))?;
+
         // Reconstruct keys: enc uses KeyInit::new_from_slice, dec uses from_seed
         let enc_key = ml_kem::kem::EncapsulationKey::<MlKem1024>::new_from_slice(enc_bytes.as_slice())
             .map_err(|_| CryptoError::KeyPersistence("invalid enc key bytes".into()))?;
@@ -157,14 +212,26 @@ impl MlKem1024Keypair {
         })
     }
 
-    pub fn load_or_generate(path: &std::path::Path) -> Result<Self, CryptoError> {
+    pub fn load_or_generate(path: &std::path::Path, encryption_key: &[u8; 32]) -> Result<Self, CryptoError> {
         if path.exists() {
-            Self::load(path)
+            Self::load(path, encryption_key)
         } else {
             let kp = Self::generate()?;
-            kp.save(path)?;
+            kp.save(path, encryption_key)?;
             Ok(kp)
         }
+    }
+
+    /// Derive an ML-KEM-1024 keypair from a 64-byte seed.
+    /// Used for deterministic sealed sender identity derivation.
+    pub fn from_seed(seed: &[u8; 64]) -> Result<Self, CryptoError> {
+        use ml_kem::kem::DecapsulationKey;
+        let dec = DecapsulationKey::<MlKem1024>::from_seed(
+            seed.as_slice().try_into()
+                .map_err(|_| CryptoError::Serialization("invalid seed length".into()))?,
+        );
+        let enc = dec.encapsulation_key();
+        Ok(Self { enc: enc.clone(), dec })
     }
 }
 
@@ -228,9 +295,13 @@ impl MlKemVariant {
 ///
 /// The variant is determined at key generation time and must be known
 /// for correct deserialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// SECURITY FIX (C2): Zeroize dec_bytes (private key seed) on drop.
+/// `variant` and `enc_bytes` are public/non-sensitive — skipped.
+#[derive(Debug, Clone, Serialize, Deserialize, ZeroizeOnDrop)]
 pub struct VariantKeypair {
+    #[zeroize(skip)]
     pub variant: MlKemVariant,
+    #[zeroize(skip)]
     pub enc_bytes: Vec<u8>,
     pub dec_bytes: Vec<u8>,
 }

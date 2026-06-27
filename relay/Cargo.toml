@@ -18,11 +18,14 @@ tracing-subscriber.workspace = true
 tokio-tungstenite.workspace = true
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+sqlx.workspace = true
 futures.workspace = true
 clap.workspace = true
 base64.workspace = true
 dirs.workspace = true
 sequoia-openpgp.workspace = true
+aes-gcm.workspace = true
+hkdf.workspace = true
 
 nullnode-protocol = { path = "../protocol" }
 nullnode-dht-core = { path = "../dht-core" }

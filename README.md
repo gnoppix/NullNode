@@ -6,6 +6,8 @@ Think of it like sending secret notes directly to your friend's house — but th
 
 Every message is protected by the strongest encryption available today (ML-KEM-1024, the US government's post-quantum standard). Even if someone records everything now and builds a supercomputer in 20 years, they still can't decrypt it.
 
+Sessions persist across restarts — if you receive a message while offline, it gets decrypted and read when you come back.
+
 ---
 
 ## How it works (the short version)

@@ -22,6 +22,7 @@ sequoia-openpgp.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 aes-gcm = "0.10"
+hkdf = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
 futures.workspace = true
@@ -31,6 +32,9 @@ nullnode-protocol = { path = "../protocol" }
 nullnode-dht-core = { path = "../dht-core" }
 nullnode-p2p = { path = "../p2p" }
 nullnode-crypto = { path = "../crypto" }
+age = { workspace = true }
+rpassword = "7"
+zeroize = { workspace = true, features = ["derive"] }
 
 [[bin]]
 name = "nullnode"

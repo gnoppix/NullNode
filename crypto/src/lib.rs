@@ -38,7 +38,7 @@ use ml_kem::kem::{Decapsulate, KeyExport};
 use ml_kem::MlKem1024;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use nullnode_protocol::pow::blake2b_8_hex;
 
@@ -317,14 +317,23 @@ struct PendingMessage {
 /// message has its own Kyber ciphertext and is decapsulated independently
 /// when it reaches its expected sequence number.
 #[allow(dead_code)]
+#[derive(ZeroizeOnDrop)]
 pub struct DoubleRatchetSession {
+    #[zeroize(skip)]
     peer_fingerprint: String,
+    #[zeroize(skip)]
     peer_null_id: String,
+    #[zeroize(skip)]
     our_fingerprint: String,
+    #[zeroize(skip)]
     is_initiator: bool,
+    #[zeroize(skip)]
     send_seq: i64,
+    #[zeroize(skip)]
     recv_seq: i64,
+    #[zeroize(skip)]
     pending: HashMap<i64, PendingMessage>,
+    #[zeroize(skip)]
     last_recv_ts: f64,
     root_key: [u8; 32],
     send_chain_key: [u8; 32],

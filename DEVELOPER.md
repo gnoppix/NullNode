@@ -174,6 +174,12 @@ session.save(path: &Path) -> Result<(), CryptoError>
 DoubleRatchetSession::load(path: &Path) -> Result<Self, CryptoError>
 ```
 
+**Session persistence in client:**
+- `MessageStore::open()` creates a `ratchet_sessions` table (peer_nid TEXT PRIMARY KEY, session_data BLOB, updated_at REAL)
+- Sessions are persisted after both `send_message` (sender side) and `handle_incoming_connection` (receiver side)
+- `relay_parses_message()` decrypts offline relay messages by loading the persisted session via sender NID
+- After decryption, the updated session state is re-saved (ratchet sequence numbers advance)
+
 **Design rules:**
 1. `encrypt()` and `decrypt()` return `CryptoResult` — callers must handle errors
 2. Ratchet state can be persisted via `save()`/`load()` for session survival across restarts
@@ -536,7 +542,12 @@ NullNode implements the Architectural & Cryptographic Specification v2.6. This s
 | Feature | ACS2.6 Mapped Requirement |
 |---------|---------------------------|
 | ML-KEM-1024 KEM for key exchange | Part I.1 (variant: 768 or 1024) |
-| Double Ratchet with HKDF chain key | Part I.1 (partial) |
+|| Double Ratchet with HKDF chain key + session persistence | Part I.1 (complete) |
+| GPG secret key encryption at rest (age passphrase) | Part III.2 (new) |
+| Memory zeroization (ZeroizeOnDrop on all secret structs) | Part III.2 (new) |
+| P2P mutual authentication (GPG-signed hello + hello-ack) | Part III.2 (new) |
+| Relay federation peer authentication enforcement | Part III.2 (new) |
+| Relay mailbox persistence (SQLite, 0o600 perms, ciphertext blobs) | Part III.2 (new) |
 | Argon2id PoW (DHT: 16MB/3iter, P2P: 1MB/2iter) | Part I.5 anti-spam |
 | HMAC federation authentication | Part I.4 (partial) |
 | TLS/WebSocket transport (optional) | Part IV.1 DPI evasion |
@@ -565,6 +576,10 @@ NullNode implements the Architectural & Cryptographic Specification v2.6. This s
 7. ~~**Database encryption**~~ ✅ Done
 8. ~~**Lifecycle hooks**~~ ✅ Done
 9. ~~**Braid Protocol**~~ ✅ Done
+9b. ~~**DoubleRatchet session persistence**~~ ✅ Done — SQLite `ratchet_sessions` table wired into send/receive paths
+9c. ~~**GPG secret key encryption**~~ ✅ Done — age passphrase protects own_cert.age on disk
+9d. ~~**Memory zeroization**~~ ✅ Done — ZeroizeOnDrop on DoubleRatchetSession, DbEncryptionKey, VariantKeypair; graceful SIGINT/SIGTERM shutdown
+9e. ~~**P2P mutual authentication**~~ ✅ Done — GPG-signed hello + hello-ack, reject unsigned, relay federation auth enforcement
 10. **Biometric access lifecycle** — Key scrubbing on app background/lock
 11. **Hardware-bound keys** — Argon2id user-derived keys, HSM integration
 
@@ -649,7 +664,12 @@ make man
 8. **Bootstrap verification** — TLS cert domain, CA, and TOFU checks prevent rogue servers
 9. **PoW anti-spam** — Argon2id memory-hard puzzles make bulk abuse infeasible
 10. **Key persistence** — All persisted keys and sessions use 0o600 permissions
-11. **Double ratchet** — Forward secrecy with per-message key derivation; sessions persist across restarts
+11. **Double ratchet** — Forward secrecy with per-message key derivation; sessions persist across restarts in SQLite ratchet_sessions table
+11b. **GPG secret key encryption** — `age` passphrase encryption (scrypt recipient, XChaCha20-Poly1305); stored at own_cert.age (0o600); supports empty passphrase for opt-out
+11c. **Memory zeroization** — All secret structs use `ZeroizeOnDrop` derive; SIGINT/SIGTERM triggers graceful shutdown (not process::exit) so drop glue zeroes keys
+11d. **P2P mutual authentication** — Both initiator and responder verify GPG signatures on hello/hello-ack. Unsigned hellos are rejected (not just warned). Prevents active MITM from injecting fake Kyber keys.
+11e. **Relay federation enforcement** — `relay-forward` messages require `peer.authenticated == true` when `shared_secret` is configured. `RelayForward.source_relay_url` enables receiver to look up sender auth state.
+11f. **Relay mailbox persistence** — SQLite database (`mailbox.db`, 0o600) stores mailbox entries with ciphertext blobs. Messages survive relay restart. In-memory cache kept for fast reads.
 12. **Signed P2P handshake** — All P2P messages are signed to prevent MITM attacks
 13. **Signature verification** — Incoming P2P messages verify sender signature before processing
 14. **Encrypted message storage** — SQLite database stores only ciphertext; no plaintext ever written to disk

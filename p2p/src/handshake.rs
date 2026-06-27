@@ -44,7 +44,7 @@ pub async fn handshake_initiator(
 
     info!("Sending p2p-hello with PoW nonce={}", nonce);
 
-    let hello = build_p2p_hello(public_key_b64, nonce, HELLO_POW_BITS, kyber_enc_key_b64);
+    let hello = build_p2p_hello(public_key_b64, nonce, HELLO_POW_BITS, kyber_enc_key_b64, "");
     send_envelope(ws, &hello).await?;
 
     // Receive hello-ack
