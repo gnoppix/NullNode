@@ -164,13 +164,14 @@ decrypt(ciphertext_hex: &str, our_kyber_dec: &KyberDecapsulationKey) -> Result<S
 2. Encapsulate shared secret with recipient's static public key
 3. Combine shared secret with ratchet chain key via SHA-256
 4. Derive AES-256-GCM key via HKDF-SHA256
-5. Wire format: `ephemeral_pk (1568B) || kyber_ct (1568B) || nonce (12B) || aes_ct`
+5. Wire format (encrypt_message): `nonce (12B) || aes_ct || kyber_ct (1568B) || 2-byte-len (big-endian)`
 
-**DoubleRatchetSession (forward secrecy + persistence):**
+**DoubleRatchetSession (forward secrecy + persistence + bidirectional E2E):**
 ```rust
-DoubleRatchetSession::new(peer_fp, peer_nid, our_fp, is_initiator) -> Result<Self, CryptoError>
-session.encrypt_message(plaintext: &str, peer_kyber_enc: &KyberEncapsulationKey) -> Result<String, CryptoError>
-session.decrypt_message(message: &str, our_kyber_keypair: &KyberKeypair) -> Result<String, CryptoError>
+DoubleRatchetSession::new(peer_fp, peer_nid, our_fp, is_initiator, shared_secret) -> Result<Self, CryptoError>
+session.encrypt_first(plaintext: &str, kyber_ct: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, CryptoError>
+session.encrypt_message(plaintext: &str, peer_kyber_enc: &KyberEncapsulationKey) -> Result<Vec<u8>, CryptoError>
+session.decrypt_message(message_b64: &str, our_kyber_keypair: &MlKem1024Keypair) -> Result<String, CryptoError>
 session.serialize() -> Result<String, CryptoError>
 DoubleRatchetSession::deserialize(json: &str) -> Result<Self, CryptoError>
 session.save(path: &Path) -> Result<(), CryptoError>
@@ -226,6 +227,9 @@ NodeConfig {
     host: String,
     port: u16,
     db_path: Option<String>,
+    ssl_certfile: String,    // TLS certificate path (direct TLS mode)
+    ssl_keyfile: String,     // TLS private key path (direct TLS mode)
+    advertised_url: Option<String>,  // Public URL when behind nginx
 }
 
 DhtNodeRuntime::new(config).await -> Self
@@ -419,6 +423,7 @@ gossip_task (background, every 60s):
 cmd_init(config)          // Generate identity
 cmd_id(config)            // Show Null ID + fingerprint
 cmd_export()              // Print armored public key
+cmd_register()            // Register identity with bootstrap DHT
 cmd_import(armored)       // Import from file or stdin
 cmd_contacts()            // List registered contacts
 cmd_add_contact(nid, fp)  // Add a contact with fingerprint
@@ -431,7 +436,22 @@ cmd_chat(nid_or_alias)    // Interactive P2P chat
 cmd_verify(nid_or_alias)  // Verify contact safety number (G6)
 cmd_safety_number(nid_or_alias) // Show safety number for a contact (G6)
 cmd_status()              // Show DHT status
+cmd_register()            // Register identity with bootstrap DHT
 ```
+
+### `nullnode register` — DHT identity registration
+
+When a client runs `nullnode init`, it should auto-register with the bootstrap DHT. If the bootstrap was unreachable during init, registration can be done explicitly:
+
+```rust
+// dht_register() sends a dht-put message to the bootstrap:
+// key: null_id, value: fingerprint, publisher_fp: fingerprint
+// Includes PoW solution (difficulty 1, 100k max attempts) and Ed25519 signature
+```
+
+The bootstrap validates: PoW, signature, key==compute_null_id(publisher_fp), then stores in DHT.
+
+**Note:** Existing `~/.nullnode/gnupg/own_cert.asc` files from before v0.3.7 may be corrupt (binary data written via `from_utf8_lossy`). Users must run `rm -rf ~/.nullnode/gnupg && ./nullnode init` to recreate.
 
 **Alias resolution:**
 
@@ -442,14 +462,15 @@ The client uses `resolve_recipient(input, aliases)` to map user-provided recipie
 | Path | Purpose |
 |---|---|
 || `~/.nullnode/identity.json` | Own Null ID + fingerprint |
-|| `~/.nullnode/contacts.json` | NID -> fingerprint mapping |
-|| `~/.nullnode/aliases.json` | Alias -> NID mapping (human-readable names) |
-|| `~/.nullnode/pin_cache.json` | DHT address TOFU pins |
-| `~/.nullnode/bootstrap_pin_cache.json` | Bootstrap TLS cert TOFU pins |
-| `~/.nullnode/dht_store.db` | SQLite DHT storage |
-| `~/.nullnode/messages.db` | SQLite message store (AES-256-GCM encrypted) |
-| `~/.nullnode/db_key.json` | Database encryption key (0o600) |
-| `~/.nullnode/delivery_secrets.json` | Per-contact delivery master secrets (0o600) |
+||| `~/.nullnode/contacts.json` | NID -> fingerprint mapping |
+||| `~/.nullnode/aliases.json` | Alias -> NID mapping (human-readable names) |
+||| `~/.nullnode/pin_cache.json` | DHT address TOFU pins |
+|| `~/.nullnode/bootstrap_pin_cache.json` | Bootstrap TLS cert TOFU pins |
+|| `~/.nullnode/dht_store.db` | SQLite DHT storage |
+|| `~/.nullnode/messages.db` | SQLite message store (AES-256-GCM encrypted) |
+|| `~/.nullnode/db_key.json` | Database encryption key (0o600) |
+|| `~/.nullnode/delivery_secrets.json` | Per-contact delivery master secrets (0o600) |
+|| `~/.nullnode/nullnode.pid` | PID file (prevents multiple instances) |
 | `~/.nullnode/kyber_keys.json` | Persisted ML-KEM keypair (0o600) |
 | `~/.nullnode/ratchet_sessions/` | Persisted ratchet sessions (0o600) |
 | `~/.nullnode/known_peers.json` | Relay TOFU peer fingerprints |
@@ -628,10 +649,10 @@ make lint
 | `nullnode-protocol` | 14 | PoW solve/check, envelope roundtrip, GPG sign/verify, braid (5) |
 | `nullnode-p2p` | 2 | Transport, handshake |
 | `nullnode-dht-core` | 17 | DHT node, SQLite, ratelimit, pin_cache, bootstrap_verify |
-| `nullnode-crypto` | 38 | encrypt/decrypt, ratchet, key derivation, kyber persistence, secure_mem (4), delivery_tokens (4), cbnp (3), pir (8) |
+| `nullnode-crypto` | 33 | encrypt/decrypt, ratchet + bidirectional roundtrip, key derivation, kyber persistence, secure_mem (4), delivery_tokens (4), cbnp (3), pir (8) |
 | `nullnode-crypto-utils` | 4 | export/import, fingerprint validation, secure_delete |
 | `nullnode-relay` | 11 | URL parse, HMAC, route table, nonce replay, loop detection |
-| **Total** | **86** | |
+| **Total** | **81** | |
 
 ---
 

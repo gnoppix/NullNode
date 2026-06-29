@@ -117,7 +117,7 @@ impl MlKem1024Keypair {
     /// The public key (`enc`) is stored in plaintext (it is not secret).
     pub fn save(&self, path: &std::path::Path, encryption_key: &[u8; 32]) -> Result<(), CryptoError> {
         use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
-        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use aes_gcm::{Aes256Gcm, Key};
         use hkdf::Hkdf;
         use sha2::Sha256;
 
@@ -222,6 +222,66 @@ impl MlKem1024Keypair {
         }
     }
 
+    /// Load or generate an unencrypted keypair (for bootstrap server identity).
+    /// Stored in plaintext - NOT for user secrets, only for bootstrap/federation nodes.
+    /// Admin can delete the file to force regeneration on next start.
+    pub fn load_or_generate_unencrypted(path: &std::path::Path) -> Result<Self, CryptoError> {
+        if path.exists() {
+            Self::load_unencrypted(path)
+        } else {
+            let kp = Self::generate()?;
+            Self::save_unencrypted(path, &kp)?;
+            Ok(kp)
+        }
+    }
+
+    /// Save keypair unencrypted (for bootstrap server identity).
+    /// Sets 0o600 permissions for basic protection.
+    pub fn save_unencrypted(path: &std::path::Path, kp: &Self) -> Result<(), CryptoError> {
+        use ml_kem::KeyExport;
+        let data = serde_json::json!({
+            "enc": hex::encode(kp.enc.to_bytes()),
+            "dec": hex::encode(kp.dec.to_bytes()),
+        });
+        std::fs::write(path, data.to_string())
+            .map_err(|e| CryptoError::KeyPersistence(format!("write failed: {}", e)))?;
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    /// Load an unencrypted keypair (no encryption key required).
+    pub fn load_unencrypted(path: &std::path::Path) -> Result<Self, CryptoError> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| CryptoError::KeyPersistence(format!("read failed: {}", e)))?;
+        let data: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| CryptoError::KeyPersistence(format!("parse failed: {}", e)))?;
+        let enc_hex = data["enc"]
+            .as_str()
+            .ok_or_else(|| CryptoError::KeyPersistence("missing enc field".into()))?;
+        let dec_hex = data["dec"]
+            .as_str()
+            .ok_or_else(|| CryptoError::KeyPersistence("missing dec field".into()))?;
+
+        let enc_bytes = hex::decode(enc_hex)
+            .map_err(|e| CryptoError::KeyPersistence(format!("enc hex decode: {}", e)))?;
+        let dec_bytes = hex::decode(dec_hex)
+            .map_err(|e| CryptoError::KeyPersistence(format!("dec hex decode: {}", e)))?;
+
+        let enc_key = ml_kem::kem::EncapsulationKey::<MlKem1024>::new_from_slice(enc_bytes.as_slice())
+            .map_err(|_| CryptoError::KeyPersistence("invalid enc key bytes".into()))?;
+        let dec_key = ml_kem::kem::DecapsulationKey::<MlKem1024>::from_seed(
+            dec_bytes.as_slice().try_into()
+                .map_err(|_| CryptoError::KeyPersistence("invalid seed length".into()))?,
+        );
+        Ok(Self {
+            enc: enc_key,
+            dec: dec_key,
+        })
+    }
+
     /// Derive an ML-KEM-1024 keypair from a 64-byte seed.
     /// Used for deterministic sealed sender identity derivation.
     pub fn from_seed(seed: &[u8; 64]) -> Result<Self, CryptoError> {
@@ -306,6 +366,7 @@ pub struct VariantKeypair {
     pub dec_bytes: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl VariantKeypair {
     /// Generate a keypair with the requested variant.
     pub fn generate(variant: MlKemVariant) -> Result<Self, CryptoError> {

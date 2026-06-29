@@ -12,7 +12,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,11 +34,17 @@ const MAILBOX_TTL_SECONDS: u64 = 86400 * 7; // 7 days
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 30;
 
 // Federation constants
+#[allow(dead_code)]
 const FEDERATION_MAX_PEERS: usize = 20;
+#[allow(dead_code)]
 const FEDERATION_GOSSIP_INTERVAL_SECONDS: u64 = 60;
+#[allow(dead_code)]
 const FEDERATION_ROUTE_TTL_SECONDS: u64 = 1800;
+#[allow(dead_code)]
 const FEDERATION_PEER_TIMEOUT_SECONDS: u64 = 300;
+#[allow(dead_code)]
 const FEDERATION_MAX_RELAY_HOPS: u8 = 5;
+#[allow(dead_code)]
 const FEDERATION_PEER_SYNC_INTERVAL_SECONDS: u64 = 30;
 
 // ------------------------------------------------------------------ //
@@ -72,7 +77,7 @@ struct MailboxStoreRequest {
     timestamp: f64,
     /// SECURITY FIX (H7): Unique nonce per store request for replay protection.
     #[serde(default)]
-    nonce: i64,
+    nonce: String,
     /// Sender's armored public key cert (optional, recommended).
     /// Needed for Sequoia in-process signature verification.
     #[serde(default)]
@@ -282,6 +287,7 @@ type FederationMessage = String; // JSON message to send to peer
 /// A known peer relay with its connection state.
 #[derive(Debug)]
 struct PeerInfo {
+    #[allow(dead_code)]
     url: String,
     /// Null IDs known to be served by this peer (from route advertisements).
     routes: HashSet<String>,
@@ -302,6 +308,7 @@ struct RouteEntry {
 }
 
 /// Federation state shared across the relay.
+#[allow(dead_code)]
 struct FederationState {
     /// Known peer relays (URL -> info).
     peers: HashMap<String, PeerInfo>,
@@ -347,6 +354,7 @@ impl FederationState {
     }
 
     /// Add a peer with its sender channel.
+    #[allow(dead_code)]
     fn add_peer(&mut self, url: String, sender: mpsc::Sender<FederationMessage>) {
         self.peers.insert(url.clone(), PeerInfo {
             url,
@@ -375,6 +383,7 @@ impl FederationState {
     }
 
     /// Record a nonce from a peer for replay protection.
+    #[allow(dead_code)]
     fn record_nonce(&mut self, peer_url: &str, nonce: &str) -> bool {
         let nonces = self.seen_nonces.entry(peer_url.to_string()).or_insert_with(Vec::new);
         if nonces.contains(&nonce.to_string()) {
@@ -451,7 +460,13 @@ impl RelayState {
             if let Some(parent) = std::path::Path::new(&path).parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let url = format!("sqlite:{}", path);
+            // Use sqlite:// URL with mode=rwc to create file if it doesn't exist
+            let url = if path.starts_with("sqlite:") || path.starts_with("sqlite://") {
+                path.clone()
+            } else {
+                format!("sqlite://{}?mode=rwc", path)
+            };
+            tracing::debug!("Opening SQLite database at: {}", url);
             let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(5)
                 .connect(&url)
@@ -637,21 +652,19 @@ impl RelayState {
             req.seq, req.timestamp, req.nonce
         );
 
+        // TOFU: cache cert BEFORE verification (first-seen-is-trusted)
+        // Now handled inside verify_gpg_detached
+
         // Verify using GPG
         let verified = verify_gpg_detached(
             &req.sender_sig,
             &signing_data,
             &req.sender_fp,
             &self.cert_cache,
+            &req.sender_cert,  // Pass cert for TOFU
         )
         .unwrap_or(false);
         if !verified {
-            // TOFU: on first sight, cache the cert from the request
-            if !req.sender_cert.is_empty() {
-                let mut cache = self.cert_cache.blocking_write();
-                cache.entry(req.sender_fp.clone())
-                    .or_insert_with(|| req.sender_cert.clone());
-            }
             return Err("sender signature verification failed".to_string());
         }
 
@@ -956,8 +969,8 @@ async fn handle_ws_connection(
     }
 
     // Message loop with heartbeat
-    let heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
-    tokio::pin!(heartbeat);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
+    heartbeat.tick().await; // consume first immediate tick
 
     loop {
         tokio::select! {
@@ -1065,8 +1078,12 @@ async fn handle_message(
 ) -> Result<(), String> {
     match env.msg_type.as_str() {
         "relay-store" => {
+            tracing::debug!("relay-store payload: {}", env.payload);
             let req: MailboxStoreRequest = serde_json::from_value(env.payload.clone())
-                .map_err(|e| format!("invalid store request: {}", e))?;
+                .map_err(|e| {
+                    tracing::warn!("parse error: {} payload: {}", e, env.payload);
+                    format!("invalid store request: {}", e)
+                })?;
 
             // SECURITY FIX (C4): Verify sender GPG signature
             state.verify_store_signature(&req).await?;
@@ -1075,7 +1092,7 @@ async fn handle_message(
             state.check_timestamp_freshness(req.timestamp)?;
 
             // SECURITY FIX (H7): Check for replayed nonces
-            if !state.check_and_record_nonce(&req.sender_fp, req.nonce).await {
+            if !state.check_and_record_nonce_str(&req.sender_fp, &req.nonce).await {
                 return Err("replay detected: nonce already seen".to_string());
             }
 
@@ -1109,15 +1126,10 @@ async fn handle_message(
                 "relay-fetch:{}:{}:{}",
                 req.recipient_nid, req.timestamp, req.nonce
             );
-            if !verify_gpg_detached(&req.sender_sig, &sig_data, &req.requester_fp, &state.cert_cache)
+            // TOFU: cert is passed directly to verify_gpg_detached
+            if !verify_gpg_detached(&req.sender_sig, &sig_data, &req.requester_fp, &state.cert_cache, &req.sender_cert)
                 .unwrap_or(false)
             {
-                // TOFU: cache cert on first sight
-                if !req.sender_cert.is_empty() {
-                    let mut cache = state.cert_cache.blocking_write();
-                    cache.entry(req.requester_fp.clone())
-                        .or_insert_with(|| req.sender_cert.clone());
-                }
                 return Err("fetch denied: GPG signature verification failed".to_string());
             }
 
@@ -1208,15 +1220,9 @@ async fn handle_message(
                 "relay-ack:{}:{}:{}:{}",
                 recipient_nid, seq, ack_ts, ack_nonce
             );
-            if !verify_gpg_detached(ack_sig, &sig_data, ack_fp, &state.cert_cache)
+            if !verify_gpg_detached(ack_sig, &sig_data, ack_fp, &state.cert_cache, ack_cert)
                 .unwrap_or(false)
             {
-                // TOFU: cache cert on first sight
-                if !ack_cert.is_empty() {
-                    let mut cache = state.cert_cache.blocking_write();
-                    cache.entry(ack_fp.to_string())
-                        .or_insert_with(|| ack_cert.to_string());
-                }
                 return Err("ack denied: GPG signature verification failed".to_string());
             }
 
@@ -1521,13 +1527,13 @@ async fn handle_message(
                 seq: forward.seq,
                 sender_sig: forward.sender_sig,
                 timestamp: forward.timestamp,
-                nonce: forward.nonce,
+                nonce: forward.nonce.to_string(),
                 sender_cert: String::new(),
                 sealed_sender: String::new(),
             };
             state.verify_store_signature(&req).await?;
             state.check_timestamp_freshness(req.timestamp)?;
-            if !state.check_and_record_nonce(&req.sender_fp, req.nonce).await {
+            if !state.check_and_record_nonce_str(&req.sender_fp, &req.nonce).await {
                 return Err("replay detected: nonce already seen".to_string());
             }
 
@@ -1618,7 +1624,7 @@ async fn handle_message(
                 "relay-purge:{}:{}:{}",
                 purge_recipient, purge_ts, purge_nonce
             );
-            if !verify_gpg_detached(&purge_sig, &sig_data, &purge_fp, &state.cert_cache)
+            if !verify_gpg_detached(&purge_sig, &sig_data, &purge_fp, &state.cert_cache, "")
                 .unwrap_or(false)
             {
                 return Err("purge denied: GPG signature verification failed".to_string());
@@ -1712,7 +1718,7 @@ async fn connect_to_peer(
     url: String,
     state: Arc<RelayState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (host, port, _use_tls) = parse_relay_url(&url)?;
+    let (_host, _port, _use_tls) = parse_relay_url(&url)?;
     
     let (ws_stream, _response) = tokio_tungstenite::connect_async(format!("{}/federation", url))
         .await?;
@@ -1830,6 +1836,7 @@ async fn gossip_task(state: Arc<RelayState>) {
 
 /// Forward a message to a remote relay.
 /// SECURITY FIX (HIGH-6): Actually sends via peer channels.
+#[allow(dead_code)]
 async fn forward_to_peer(
     state: Arc<RelayState>,
     relay_url: &str,
@@ -1862,22 +1869,33 @@ async fn forward_to_peer(
 /// SECURITY FIX (C4): Verify a GPG detached signature using Sequoia (in-process).
 ///
 /// Looks up the cert from the cert cache by fingerprint, then verifies
-/// the detached signature against the data.
+/// the detached signature against the data. If cert is provided, adds it to cache first (TOFU).
 fn verify_gpg_detached(
     sig_b64: &str,
     data: &str,
     fingerprint: &str,
     cert_cache: &RwLock<HashMap<String, String>>,
+    provided_cert: &str,  // New: optional cert to add to cache
 ) -> Result<bool, String> {
     use base64::Engine;
     use sequoia_openpgp::parse::Parse;
+
+    // TOFU: if cert provided, add to cache BEFORE verification
+    if !provided_cert.is_empty() {
+        let mut cache = cert_cache.try_write()
+            .map_err(|e| format!("cert cache write lock: {}", e))?;
+        cache.entry(fingerprint.to_string())
+            .or_insert_with(|| provided_cert.to_string());
+    }
+
+    // Look up the cert from cache — use try_read to avoid blocking the runtime
+    let cache = cert_cache.try_read()
+        .map_err(|e| format!("cert cache lock: {}", e))?;
 
     let sig_bytes = base64::engine::general_purpose::STANDARD
         .decode(sig_b64)
         .map_err(|e| format!("base64 decode signature: {}", e))?;
 
-    // Look up the cert from cache
-    let cache = cert_cache.blocking_read();
     let armored = match cache.get(fingerprint) {
         Some(cert) => cert.clone(),
         None => {
@@ -1892,9 +1910,12 @@ fn verify_gpg_detached(
     let cert = sequoia_openpgp::Cert::from_bytes(armored.as_bytes())
         .map_err(|e| format!("parse cached cert: {}", e))?;
 
+    let sig_str = String::from_utf8(sig_bytes.clone())
+        .map_err(|e| format!("signature UTF-8 error: {}", e))?;
+
     // Use nullnode-protocol's verify_detached
     nullnode_protocol::gpg::verify_detached(
-        &String::from_utf8_lossy(&sig_bytes),
+        &sig_str,
         data,
         &cert,
     )
@@ -1976,7 +1997,8 @@ fn parse_relay_url(url: &str) -> Result<(String, u16, bool), Box<dyn std::error:
     Ok((host.to_string(), port, use_tls))
 }
 
-/// Generate a random challenge for peer authentication.
+/// SECURITY FIX (M12): Challenge generation for peer authentication.
+#[allow(dead_code)]
 fn generate_challenge() -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
@@ -2058,6 +2080,11 @@ struct Args {
     #[arg(long)]
     tls_key: Option<String>,
 
+    /// Path to SQLite database file for mailbox persistence.
+    /// Defaults to {gpg_home}/mailbox.db if not specified.
+    #[arg(long)]
+    db_path: Option<String>,
+
     /// ACS2.6 Part V.1: Enable CBNP (Coordinated Baseline Noise Protocol) cover traffic.
     /// When enabled, the relay generates synthetic cover packets to maintain a constant
     /// network traffic profile, preventing traffic analysis during idle periods.
@@ -2082,18 +2109,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // SECURITY FIX (C4): Determine GPG home directory
+    // Use --gpg-home if provided, otherwise default to ~/.nullnode/gnupg
     let gpg_home = args.gpg_home.clone().unwrap_or_else(|| {
         dirs::home_dir()
             .map(|h| h.join(".nullnode/gnupg").to_string_lossy().to_string())
-            .unwrap_or_else(|| "~/.nullnode/gnupg".to_string())
+            .unwrap_or_else(|| {
+                // Fallback: try $HOME env var, then /var/lib/nullnode
+                std::env::var("HOME")
+                    .map(|h| format!("{}/.nullnode/gnupg", h))
+                    .unwrap_or_else(|_| "/var/lib/nullnode/gnupg".to_string())
+            })
     });
+
+    // Ensure GPG home directory exists
+    if !std::path::Path::new(&gpg_home).exists() {
+        if let Err(e) = std::fs::create_dir_all(&gpg_home) {
+            tracing::warn!("Could not create GPG home {}: {}", gpg_home, e);
+        }
+    }
+
+    // Detect reverse proxy mode by host binding
+    let is_behind_proxy = args.host == "127.0.0.1" || args.host == "0.0.0.0" || args.host == "::1";
 
     // SECURITY FIX (C5): Load TLS acceptor if cert+key provided
     let tls_acceptor = if let (Some(cert_path), Some(key_path)) = (&args.tls_cert, &args.tls_key) {
         Some(load_tls_acceptor(cert_path, key_path)?)
-    } else {
+    } else if !is_behind_proxy {
         tracing::warn!("TLS not configured -- relay running in plaintext mode (ws://). \
                         For production, use --tls-cert and --tls-key.");
+        None
+    } else {
+        // Behind nginx proxy - TLS handled by proxy, silence warning
         None
     };
 
@@ -2133,7 +2179,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let db_path = format!("{}/mailbox.db", gpg_home);
+    // Use explicit db_path or derive from gpg_home
+    let db_path = args.db_path.clone().unwrap_or_else(|| {
+        format!("{}/mailbox.db", gpg_home)
+    });
     let allow_relay = args.allow_relay;
     let state = Arc::new(RelayState::new(shared_secret.clone(), gpg_home, Some(db_path), allow_relay).await?);
     {
@@ -2296,6 +2345,7 @@ impl RelayState {
     }
 
     /// Decrypt sender metadata encrypted with `encrypt_metadata`.
+    #[allow(dead_code)]
     fn decrypt_metadata(encrypted_hex: &str, key: &[u8; 32]) -> Option<String> {
         use aes_gcm::aead::Aead;
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};

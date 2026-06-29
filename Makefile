@@ -29,7 +29,7 @@ BINDIR      := $(PREFIX)/bin
 VERSION     := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//;s/"//')
 GIT_HASH    := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE  := $(shell date -u +%Y-%m-%d)
-RUSTFLAGS   := -C target-cpu=native
+RUSTFLAGS   ?=
 
 # ------------------------------------------------------------------ #
 #  Targets                                                           #

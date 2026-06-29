@@ -1,7 +1,7 @@
 [package]
 name = "nullnode-bootstrap"
 version.workspace = true
-edition.workspace = true
+edition = "2024"
 description = "NullNode bootstrap DHT server (standalone binary)"
 
 [dependencies]
@@ -23,6 +23,8 @@ blake2.workspace = true
 sequoia-openpgp.workspace = true
 nullnode-protocol = { path = "../protocol" }
 nullnode-dht-core = { path = "../dht-core" }
+nullnode-crypto = { path = "../crypto" }
+ml-kem = "0.3"
 
 [[bin]]
 name = "nullnode-bootstrap"

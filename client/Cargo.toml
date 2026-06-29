@@ -25,6 +25,7 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
+rustls = { workspace = true }
 futures.workspace = true
 url.workspace = true
 
@@ -35,6 +36,8 @@ nullnode-crypto = { path = "../crypto" }
 age = { workspace = true }
 rpassword = "7"
 zeroize = { workspace = true, features = ["derive"] }
+hickory-resolver = { workspace = true }
+libc = "0.2"
 
 [[bin]]
 name = "nullnode"

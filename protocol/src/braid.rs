@@ -119,7 +119,7 @@ use sha2::{Sha512, Digest};
 
 /// Split a key into braid chunks for streaming exchange.
 pub fn split_key_to_chunks(key: &[u8]) -> Vec<BraidChunk> {
-    let total_chunks = (key.len() + BraidHandshake::CHUNK_SIZE - 1) / BraidHandshake::CHUNK_SIZE;
+    let total_chunks = key.len().div_ceil(BraidHandshake::CHUNK_SIZE);
     let ek_hash = {
         let mut hasher = Sha512::new();
         hasher.update(key);

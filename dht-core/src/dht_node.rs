@@ -136,8 +136,15 @@ impl DhtNodeRuntime {
                 }
             }
         } else {
-            warn!("DHT node TLS not configured (ssl_certfile/ssl_keyfile empty) — running in plaintext mode (ws://). \
-                  For production, set ssl_certfile and ssl_keyfile in NodeConfig.");
+            // Detect reverse proxy mode by host binding:
+            // - 127.0.0.1 or 0.0.0.0 = behind nginx (proxied)
+            // - Real external IP = direct TLS required
+            let behind_proxy = self.config.host == "127.0.0.1" || 
+                               self.config.host == "0.0.0.0" ||
+                               self.config.advertised_url.is_some();
+            if !behind_proxy {
+                warn!("DHT node TLS not configured (ssl_certfile/ssl_keyfile empty) — running in plaintext mode (ws://). For production, set --tls-cert and --tls-key, or use --advertised-url with nginx proxy.");
+            }
             None
         };
 
@@ -441,11 +448,14 @@ impl DhtNodeRuntime {
         // Verify proof-of-work
         // SECURITY FIX (M11): Use node's fingerprint as per-node secret
         // to make PoW computation unique per node.
+        // Identity registration (seq==0) uses difficulty 8 (fast, one-time).
+        // Updates/re-registration (seq>0) use full DHT_POW_DIFFICULTY (16).
+        let pow_difficulty = if seq == 0 { 8 } else { constants::DHT_POW_DIFFICULTY };
         let pow_data = format!("{key}{value_b64}{salt}{seq}");
         let pow_ok = pow_check(
             &pow_data,
             nonce as u64,
-            constants::DHT_POW_DIFFICULTY,
+            pow_difficulty,
             node_fingerprint.as_bytes(),
         )
         .unwrap_or(false);

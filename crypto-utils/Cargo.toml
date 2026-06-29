@@ -5,7 +5,7 @@ edition.workspace = true
 description = "NullNode crypto utilities: GPG operations, secure deletion, STUN protocol"
 
 [dependencies]
-sequoia-openpgp = "2"
+sequoia-openpgp.workspace = true
 rand.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -128,8 +128,7 @@ pub fn get_own_fingerprint() -> CryptoUtilsResult<String> {
             std::io::Error::new(std::io::ErrorKind::NotFound, "home dir not found")
         ))?;
 
-    let armored = std::fs::read_to_string(&path)
-        .map_err(|e| CryptoUtilsError::Io(e))?;
+    let armored = std::fs::read_to_string(&path)?;
 
     let cert = parse_cert_armored(&armored)?;
     Ok(fingerprint_from_cert(&cert))
@@ -143,8 +142,7 @@ pub fn export_pubkey() -> CryptoUtilsResult<String> {
             std::io::Error::new(std::io::ErrorKind::NotFound, "home dir not found")
         ))?;
 
-    std::fs::read_to_string(&path)
-        .map_err(|e| CryptoUtilsError::Io(e))
+    std::fs::read_to_string(&path).map_err(CryptoUtilsError::Io)
 }
 
 /// Import a public key (armored) and return its fingerprint.
@@ -174,8 +172,7 @@ pub fn import_pubkey(armored: &str) -> CryptoUtilsResult<String> {
         ))?;
     let _ = std::fs::create_dir_all(&cert_dir);
     let cert_path = cert_dir.join(format!("{}.asc", safe_fp));
-    std::fs::write(&cert_path, armored)
-        .map_err(|e| CryptoUtilsError::Io(e))?;
+    std::fs::write(&cert_path, armored).map_err(CryptoUtilsError::Io)?;
 
     info!("Imported key with fingerprint {}", fp);
     Ok(fp)

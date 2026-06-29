@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.3.9 — Bidirectional E2E Encryption & Wire Format Fix (2026-06-29)
+
+### Critical Fixes
+- **Bidirectional Double Ratchet wire format fix** — `encrypt_message()` in `crypto/src/lib()` wrote the 2-byte Kyber ciphertext length BEFORE the Kyber CT (`nonce + aes_ct + 2-byte-len + kyber_ct`), but `decrypt_message()` read it from the END of the body. This caused `kyber_len` to be parsed as random bytes from the Kyber CT itself, always exceeding body length, so the receiver fell back to `simple_decrypt` which doesn't mix in the Kyber shared secret — resulting in AES-GCM decryption failure in the reverse direction. Fixed by moving the 2-byte length field to the END: `nonce + aes_ct + kyber_ct + 2-byte-len`. This enables full bidirectional E2E messaging (initiator→responder AND responder→initiator).
+
+### E2E Verification
+- **Full bidirectional E2E test verified** — amu@mac ↔ debian@us via relay at root@is, both directions decrypting successfully across multiple ratchet hops.
+
+### Test Coverage
+- Added `test_bidirectional_ratchet_roundtrip` regression test — exercises 4-message round-trip (first message via simple_decrypt + 3 subsequent messages via Kyber-mixed decryption).
+- Total: 32 crypto tests pass (was 31 in 0.3.8), 16 protocol tests unchanged.
+
+## 0.3.8 — TOFU GPG Verification Fix (2026-06-28)
+
+### Fixes
+- **Relay GPG TOFU verification fixed** — `verify_gpg_detached()` now caches certificates BEFORE signature verification (previously cached after, causing verification to fail on first fetch). This enables seamless P2P message delivery without pre-registration.
+- **Signature UTF-8 handling corrected** — Changed `String::from_utf8_lossy()` to `String::from_utf8()` for proper signature validation. Armored signatures are already UTF-8-safe; lossy conversion could corrupt them.
+
+### Data Migration Required
+- No migration required. The fix is in relay-side verification logic.
+
+## 0.3.7 — Auto-Discovery, Armored Certs, Register & PID Lock (2026-06-27)
+
+### New Features
+- **DNS SRV auto-discovery** — Client now discovers bootstrap and relay servers via `_nullnode-bootstrap._tcp.gnoppix.org` and `_nullnode-relay._tcp.gnoppix.org` SRV records. Falls back to hardcoded defaults, then localhost. CLI `--seed`/`--relay` flags still override.
+- **Identity override confirmation** — `nullnode init` now checks for existing identity and requires typing `yes` before destroying it.
+- **`nullnode register` subcommand** — Explicitly registers identity with the bootstrap DHT (solves PoW at difficulty 16). Needed when init was run without bootstrap connectivity.
+- **PID file lock** — `~/.nullnode/nullnode.pid` prevents multiple instances from racing on the same SQLite DB and GPG home. Detects stale locks and checks if PID is alive.
+
+### Fixes
+- **GPG cert serialization: binary → ASCII-armored** — `generate_identity()` was writing raw binary OpenPGP data to `own_cert.asc`, corrupting it via `String::from_utf8_lossy()`. Now uses `cert.as_tsk().armored().serialize()` for proper ASCII output. Existing corrupt certs are detected with a clear error message.
+- **Corrupt cert detection** — `load_cert()` now detects binary/null-byte files and suggests `rm -rf ~/.nullnode/gnupg && nullnode init`.
+- **rustls CryptoProvider** — Added `rustls::crypto::ring::default_provider().install_default()` to fix panic on `wss://` connections.
+- **Both bootstrap and relay use `/ws` path** — Consistent WebSocket path across all configs (fallback + SRV discovery).
+
+### Breaking Changes (data)
+- Existing `~/.nullnode/gnupg/own_cert.asc` files from before v0.3.7 are **corrupt** (binary data). Users must delete `~/.nullnode/gnupg/` and re-run `nullnode init`.
+
+## 0.3.3 — Static Build: Sequoia crypto-rust Backend (2026-06-27)
+
+### Fixes
+- **Sequoia OpenPGP now uses pure-Rust crypto backend** (`crypto-rust` instead of `crypto-nettle`). This eliminates the `libnettle.so.8` shared library dependency, fixing `undefined symbol: nettle_ocb_set_key` errors on systems with older Nettle versions.
+- **crypto-utils crate fixed** — Changed direct `sequoia-openpgp = "2"` to `workspace = true` so all crates use the same backend (prevented "Multiple cryptographic backends selected" build error).
+
+### Trade-offs
+- `crypto-rust` is marked **experimental** by Sequoia. For a censorship-resistant messenger, portability (no C deps) is more important than the "stable" label on the Nettle backend. Variable-time crypto is allowed for non-constant-time RSA operations.
+
+## 0.3.2 — Client SQLite Fix & rustls Provider (2026-06-27)
+
+### Fixes
+- **Client SQLite connection fixed** — Same `sqlite://{path}?mode=rwc` fix as relay (0.2.9). Client's `MessageStore::open()` now auto-creates the database file.
+- **rustls CryptoProvider installed** — Client now calls `rustls::crypto::ring::default_provider().install_default()` at startup. Without this, any `wss://` connection panicked with "Could not automatically determine the process-level CryptoProvider".
+
+## 0.3.0 — Client --seed/--relay Flags & Remote Testing (2026-06-27)
+
+### Features
+- **`--seed` flag** — Override default bootstrap URL (`ws://127.0.0.1:9001`) from CLI
+- **`--relay` flag** — Override default relay URL (`ws://127.0.0.1:8765`) from CLI
+- Enables remote testing against deployed servers: `nullnode --seed wss://bootstrap.example.com --relay wss://relay.example.com/ws status`
+
+### Fixes
+- **Relay SQLite connection fixed** — Changed URL from `sqlite:path` to `sqlite://path?mode=rwc` so sqlx 0.8 auto-creates DB file
+- **Relay auto-creates gpg-home directory** — If `--gpg-home` directory doesn't exist, it's created automatically instead of falling back to a literal `~` path.
+- **Relay `--db-path` flag added** — Explicit control over SQLite database file location, independent of `--gpg-home`.
+
+## 0.2.8 — TLS Proxy Detection & Bootstrap Auto-Key Generation (2026-06-27)
+
+### New features
+- **Bootstrap `--tls-cert` and `--tls-key` flags** — Direct TLS mode for bootstrap when not behind nginx
+- **Bootstrap `--allow-no-key` behavior fixed** — `--allow-no-key` no longer generates Kyber keys (dev/test only uses random ID)
+- **Bootstrap auto-generates Kyber-1024 identity** — When no GPG key exists and `--allow-no-key` not set, creates `~/.nullnode/kyber_keypair.json` for stable Null ID
+- **Host-based TLS detection** — TLS warning only appears when listening on external IP without certs (silenced for `127.0.0.1`/`0.0.0.0` proxy mode)
+- **Relay TLS warning suppressed in proxy mode** — When `--host 127.0.0.1` or `--host 0.0.0.0`, TLS warning is silent since nginx handles TLS termination
+
+### Fixes
+- **Makefile `target-cpu=native` removed** — Fixes "Illegal instruction" errors on Intel i7-1068NG7 (Ice Lake) CPUs
+
+### Dependencies
+- `ml-kem = "0.3"` added to bootstrap crate
+
 ## 0.2.7 — Relay Mailbox Persistence (2026-06-26)
 
 ### Security fixes

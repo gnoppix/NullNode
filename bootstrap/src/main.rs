@@ -1,11 +1,5 @@
 //-------------------------------------------------------------------------------
 // Name: Gnoppix Linux - Services
-// Architecture: all
-// Date: 2002-2026 by Gnoppix Linux
-// Author: Andreas Mueller
-// Website: https://www.gnoppix.com
-// Licence: Business Source License (BSL / BUSL)
-// You can use the code for free if your company or organisation doesn't have more than 2 people.
 //-------------------------------------------------------------------------------
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -31,18 +25,23 @@ struct Args {
     db: Option<String>,
 
     /// Public URL advertised in DHT records when behind a reverse proxy.
-    /// When set, the node advertises this URL (e.g. wss://bootstrap.example.com)
-    /// instead of its local bind address. Use this when nginx terminates TLS on :443
-    /// and forwards WebSocket to this daemon on localhost.
     #[arg(long)]
     advertised_url: Option<String>,
 
     /// Allow starting without a GPG key (uses a random, unstable Null ID).
-    /// DANGER: This is intended only for development and testing. The node ID
-    /// will change on every restart, breaking DHT routing. In production you
-    /// MUST provide a GPG key so the Null ID is derived deterministically.
     #[arg(long)]
     allow_no_key: bool,
+
+    /// Path to TLS certificate file (PEM) for direct TLS mode.
+    /// When set, bootstrap accepts wss:// connections directly.
+    /// For nginx TLS termination, omit this and use --advertised-url.
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// Path to TLS private key file (PEM).
+    /// Must be used with --tls-cert.
+    #[arg(long)]
+    tls_key: Option<String>,
 }
 
 #[tokio::main]
@@ -56,86 +55,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let null_id = match args.id {
         Some(id) => id,
         None => {
-            // SECURITY FIX (H5): Derive Null ID from GPG fingerprint instead of
-            // using a random value. This ensures the bootstrap server's identity
-            // is cryptographically linked to its GPG key, preventing impersonation.
+            // Try GPG key first (recommended for production)
             let gpg_home = dirs::home_dir()
                 .map(|h| h.join(".nullnode/gnupg").to_string_lossy().to_string())
                 .unwrap_or_else(|| "~/.nullnode/gnupg".to_string());
 
-            // Try to get the server's GPG fingerprint
-            match get_gpg_fingerprint(&gpg_home) {
-                Some(fp) => nullnode_dht_core::compute_null_id(&fp),
-                None => {
-                    // In dev mode (#[cfg(test)] or --allow-no-key), fall back to a
-                    // random ID so developers can still spin up a node quickly.
-                    // In production, refuse to start — an unstable node ID breaks
-                    // DHT routing because peers cannot find a consistent bootstrap.
-                    #[cfg(test)]
-                    {
-                        tracing::warn!("No GPG key found -- using random ID (test mode)");
-                        use rand::Rng;
-                        let mut rng = rand::thread_rng();
-                        nullnode_dht_core::compute_null_id(&hex::encode(
-                            rng.r#gen::<[u8; 8]>(),
-                        ))
-                    }
-                    #[cfg(not(test))]
-                    {
-                        if args.allow_no_key {
-                            tracing::warn!(
-                                "No GPG key found -- using random ID (--allow-no-key). \
-                                 DO NOT use this in production: the node ID will \
-                                 change on every restart, breaking DHT routing."
-                            );
-                            use rand::Rng;
-                            let mut rng = rand::thread_rng();
-                            nullnode_dht_core::compute_null_id(&hex::encode(
-                                rng.r#gen::<[u8; 8]>(),
-                            ))
-                        } else {
-                            eprintln!(
-                                "\n\
-                                 ╔══════════════════════════════════════════════════════════╗\n\
-                                 ║  FATAL: No GPG key found for the bootstrap server.      ║\n\
-                                 ╚══════════════════════════════════════════════════════════╝\n\
-                                 \n\
-                                 The bootstrap server MUST have a stable, deterministic\n\
-                                 Null ID derived from a GPG key. Without one, the node\n\
-                                 ID changes on every restart, which breaks DHT routing\n\
-                                 because peers cannot find a consistent bootstrap node.\n\
-                                 \n\
-                                 To fix this, generate or import a GPG key:\n\
-                                 \n\
-                                   1. Generate a new key (recommended):\n\
-                                      gpg --homedir ~/.nullnode/gnupg \\\n\
-                                          --batch --gen-key <<EOF\n\
-                                 %%no-protection\n\
-                                 Key-Type: EdDSA\n\
-                                 Key-Curve: ed25519\n\
-                                 Subkey-Type: ECDH\n\
-                                 Subkey-Curve: cv25519\n\
-                                 Name-Real: Gnoppix Bootstrap Node\n\
-                                 Expire-Date: 0\n\
-                                 EOF\n\
-                                      gpg --homedir ~/.nullnode/gnupg \\\n\
-                                          --armor --export > ~/.nullnode/gnupg/own_cert.asc\n\
-                                 \n\
-                                   2. Or import an existing key:\n\
-                                      gpg --homedir ~/.nullnode/gnupg \\\n\
-                                          --import <keyfile>\n\
-                                      gpg --homedir ~/.nullnode/gnupg \\\n\
-                                          --armor --export <fingerprint> \\\n\
-                                          > ~/.nullnode/gnupg/own_cert.asc\n\
-                                 \n\
-                                 Alternatively, pass --id <NULL_ID> to use a specific\n\
-                                 Null ID directly, or pass --allow-no-key to start\n\
-                                 anyway with a random (unstable) ID — only for dev.\n"
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                }
+            if let Some(fp) = get_gpg_fingerprint(&gpg_home) {
+                nullnode_dht_core::compute_null_id(&fp)
+            } else if args.allow_no_key {
+                // --allow-no-key for dev/testing: random unstable ID, NO KEY GENERATION
+                tracing::warn!("No GPG key found -- using random unstable ID (--allow-no-key)");
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                nullnode_dht_core::compute_null_id(&hex::encode(
+                    rng.r#gen::<[u8; 8]>(),
+                ))
+            } else if let Some(id) = load_or_generate_kyber_id() {
+                // Auto-generate Kyber keys for bootstrap identity (only when --allow-no-key NOT set)
+                id
+            } else {
+                eprintln!(
+                    "\n\
+                     ╔══════════════════════════════════════════════════════════╗\n\
+                     ║  FATAL: No GPG key found for the bootstrap server.      ║\n\
+                     ╚══════════════════════════════════════════════════════════╝\n\
+                     \n\
+                     The bootstrap server MUST have a stable, deterministic\n\
+                     Null ID derived from a GPG key (or auto-generated Kyber)\n\
+                     Without one, the node ID changes on every restart.\n\
+                     \n\
+                     Options:\n\
+                       1. GPG key: see gpg --help for key generation\n\
+                       2. --id <NULL_ID> to use specific identity\n\
+                       3. --allow-no-key for dev/testing (unstable ID)\n"
+                );
+                std::process::exit(1);
             }
         }
     };
@@ -153,6 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port: args.port,
         db_path: Some(db_path.clone()),
         advertised_url: args.advertised_url.clone(),
+        ssl_certfile: args.tls_cert.clone().unwrap_or_default(),
+        ssl_keyfile: args.tls_key.clone().unwrap_or_default(),
         ..Default::default()
     };
 
@@ -170,8 +126,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Load or generate Kyber keypair for bootstrap identity.
+/// Stored at ~/.nullnode/kyber_keypair.json - persistent across restarts.
+fn load_or_generate_kyber_id() -> Option<String> {
+    use ml_kem::KeyExport;
+    let home = dirs::home_dir()?;
+    let kx_path = home.join(".nullnode").join("kyber_keypair.json");
+    
+    // Ensure directory exists
+    let _ = std::fs::create_dir_all(home.join(".nullnode"));
+    
+    match nullnode_crypto::MlKem1024Keypair::load_or_generate_unencrypted(&kx_path) {
+        Ok(kp) => {
+            let enc_bytes = hex::encode(kp.enc.to_bytes());
+            let id = nullnode_dht_core::compute_null_id(&enc_bytes);
+            tracing::info!("Loaded persistent Kyber keypair for bootstrap identity");
+            Some(id)
+        }
+        Err(e) => {
+            tracing::error!("Failed to load/generate Kyber keypair: {}", e);
+            None
+        }
+    }
+}
+
 /// SECURITY FIX (H5): Get the server's GPG fingerprint from the local cert file.
-/// Returns the first key's fingerprint, or None if no cert/key exists.
 fn get_gpg_fingerprint(gpg_home: &str) -> Option<String> {
     use sequoia_openpgp::parse::{Parse, PacketParserBuilder};
 
@@ -186,14 +165,10 @@ fn get_gpg_fingerprint(gpg_home: &str) -> Option<String> {
     };
 
     // Parse the cert and extract the fingerprint
-    let pile = match PacketParserBuilder::from_bytes(armored.as_bytes())
+    let pile = PacketParserBuilder::from_bytes(armored.as_bytes())
         .map_err(|e| tracing::debug!("parse cert: {}", e))
         .ok()
-        .and_then(|b| b.into_packet_pile().ok())
-    {
-        Some(pile) => pile,
-        None => return None,
-    };
+        .and_then(|b| b.into_packet_pile().ok())?;
 
     for packet in pile.descendants() {
         if let sequoia_openpgp::Packet::PublicKey(cert) = packet {

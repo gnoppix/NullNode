@@ -69,6 +69,7 @@ pub struct CbnpSession {
     config: CbnpConfig,
     running: Arc<AtomicBool>,
     cover_count: Arc<AtomicU64>,
+    #[allow(dead_code)]
     last_send: Arc<std::sync::Mutex<Instant>>,
     /// Public key used for cover traffic (distinct from real identity)
     cover_public_key: [u8; 32],

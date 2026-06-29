@@ -19,7 +19,7 @@
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
 
 use crate::CryptoError;
 

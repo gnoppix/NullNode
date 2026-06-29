@@ -1,8 +1,8 @@
 # ACS2.6 Implementation Worklist — First App Audit
 
-**Date:** 2026-06-25
+**Date:** 2026-06-29 (updated 2026-06-29)
 **Spec:** ACS2.6.md (Architectural & Cryptographic Specification v2.6)
-**Current state:** ✅ B1-B5 + I1-I2 complete. First app ready.
+**Current state:** ✅ B1-B5 + I1-I2 + E1-E5 complete. Bidirectional E2E ratchet decryption fixed in v0.3.9. First app ready.
 
 > **Documentation:** [README.md](README.md) · [DEVELOPER.md](DEVELOPER.md) · [FAQ.md](FAQ.md) · [CHANGELOG.md](CHANGELOG.md) · [ACS2.6.md](ACS2.6.md)
 
@@ -236,6 +236,20 @@ These are the items that MUST be done for a usable first app:
 | 4 | **Database encryption at rest** | ✅ Done | Application-level AES-256-GCM in `MessageStore` (B3) |
 | 5 | **Guard pages for key memory** | ✅ Done | `GuardedKeyMaterial` with mmap PROT_NONE pages (B1) |
 
+### 🔐 Bidirectional E2E Encryption (Ratchet) -- RESOLVED in v0.3.9
+
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| E1 | **Initiator can decrypt responder's reply** | ✅ Resolved (v0.3.9) | Wire format fix: `encrypt_message` now puts 2-byte Kyber CT length AFTER kyber_ct (not before), matching what `decrypt_message` expects |
+| E2 | **Responder can decrypt follow-up messages from initiator** | ✅ Resolved (v0.3.9) | Symmetric ratchet step on receive direction works after initial DH ratchet |
+| E3 | **Out-of-order message handling (skip message keys)** | ✅ Resolved (v0.3.9) | `skip_message_keys` buffer correctly stores chain keys for gaps up to N=1000 |
+| E4 | **Double Ratchet state synchronization** | ✅ Resolved (v0.3.9) | Both parties maintain consistent `root_key`, `chain_key_send`, `chain_key_recv`, `dh_ratchet_key_pair` |
+| E5 | **E2E encrypted round-trip in integration test** | ✅ Resolved (v0.3.9) | `test_bidirectional_ratchet_roundtrip` passes: 4-message round-trip (initiator→responder→initiator→responder) with Kyber-mixed decryption on all subsequent messages |
+
+> **v0.3.9 fix summary:** The root cause was a wire format mismatch in `encrypt_message()` vs `decrypt_message()`. The sender wrote `nonce + aes_ct + 2-byte-len + kyber_ct` but the receiver read the 2-byte length from the END of the body. Since the last 2 bytes of the Kyber ciphertext are effectively random, `kyber_len` was always wrong, causing the receiver to fall back to `simple_decrypt` which doesn't mix in the Kyber shared secret — resulting in AES-GCM decryption failure. Fixed by moving the 2-byte length to the end: `nonce + aes_ct + kyber_ct + 2-byte-len`.
+
+---
+
 ### 🟡 Important (should have for first app) -- ALL DONE
 
 | # | Task | Status | Notes |
@@ -277,6 +291,9 @@ These are the items that MUST be done for a usable first app:
 6. ✅ TOFU cert admission (I1) — Relay peer fingerprint pinning
 7. ✅ Lifecycle memory hooks (I2) — SIGINT graceful shutdown
 8. ⚠️ Braid protocol — Library exists, optional for v1 (monolithic key works)
+
+**Completed 2026-06-29 (v0.3.9):**
+9. ✅ Bidirectional E2E ratchet decryption (E1-E5) — Double Ratchet now advances correctly on both send and receive directions; initiator can decrypt responder's reply
 
 **Remaining deferred items (v2.6 follow-up):**
 PQ-Sender Keys, Hardware-bound keys, Anti-forensic rollback, OHT, Bloom filters, Jurisdictional splitting, Confidential computing, Mobile push, Adaptive budgeting, WoT certs, Edge-core modes, Obfuscation transports, Memory shredding on mobile, Biometric gates

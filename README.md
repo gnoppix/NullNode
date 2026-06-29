@@ -1,12 +1,20 @@
 # NullNode
 
-**Post Quantum Encryption, decentalized modern messaging that needs no phone, no email, and no personal information, no company in between.**
+**Post Quantum Encryption, decentralized modern messaging that needs no phone, no email, and no personal information, no company in between.**
 
 Think of it like sending secret notes directly to your friend's house — but the mailman, the post office, and even the government can't read them. NullNode is a messenger that connects you directly to the people you talk to. No company sits in the middle seeing your messages.
 
 Every message is protected by the strongest encryption available today (ML-KEM-1024, the US government's post-quantum standard). Even if someone records everything now and builds a supercomputer in 20 years, they still can't decrypt it.
 
 Sessions persist across restarts — if you receive a message while offline, it gets decrypted and read when you come back.
+
+---
+
+## What's new in v0.3.9
+
+- **Bidirectional E2E encryption** — Full bidirectional Double Ratchet encryption verified end-to-end. Initiator and responder can both send and receive encrypted messages through the relay, with the ratchet advancing correctly in both directions.
+- **Wire format fix** — Corrected the Kyber ciphertext length field placement in `encrypt_message()` to match what `decrypt_message()` expects. This was causing AES-GCM decryption failures when the responder replied to the initiator.
+- **Regression test** — Added `test_bidirectional_ratchet_roundtrip` to prevent this class of bug from recurring.
 
 ---
 
@@ -25,11 +33,11 @@ It's like BitTorrent, but for private messaging.
 
 NullNode has three binaries. Each is run by a different role:
 
-| Binary | Run by | What it does |
-|---|---|---|
-| `nullnode` | **You** (the user) | Your personal messenger client. You send, read, and receive messages. |
-| `nullnode-relay` | **A relay operator** | A store-and-forward server. Holds encrypted messages until the recipient comes online. |
-| `nullnode-bootstrap` | **A seed server operator** | The DHT seed node. Clients look it up to find peers. Think of it as the "phone book". |
+|| Binary | Run by | What it does |
+||---|---|---|
+|| `nullnode` | **You** (the user) | Your personal messenger client. You send, read, and receive messages. |
+|| `nullnode-relay` | **A relay operator** | A store-and-forward server. Holds encrypted messages until the recipient comes online. |
+|| `nullnode-bootstrap` | **A seed server operator** | The DHT seed node. Clients look it up to find peers. Think of it as the "phone book". |
 
 ### 1. Build everything
 
@@ -94,7 +102,17 @@ Aliases map a short human-readable name to a Null ID. You can then use the alias
 ./target/release/nullnode read
 ```
 
-### 7. Listen for incoming P2P connections
+### 7. Register identity with DHT
+
+If your identity was created while the bootstrap was unreachable, register it explicitly:
+
+```bash
+./target/release/nullnode register
+```
+
+This sends your Null ID and fingerprint to the bootstrap DHT so others can find you.
+
+### 8. Listen for incoming P2P connections
 
 ```bash
 ./target/release/nullnode listen
@@ -131,6 +149,17 @@ For production deployments, run the bootstrap behind nginx to get TLS 1.3 on por
     --advertised-url wss://bootstrap.example.com/ws
 ```
 
+The bootstrap will automatically use stable IDs (auto-generated Kyber-1024 keypair if no GPG key exists) and operate in "proxy mode" (no TLS warning when `--host` is `127.0.0.1`).
+
+For direct TLS mode (when NOT behind nginx), provide certificates:
+
+```bash
+./target/release/nullnode-bootstrap \
+    --host 0.0.0.0 --port 443 \
+    --tls-cert /etc/letsencrypt/live/bootstrap.example.com/fullchain.pem \
+    --tls-key /etc/letsencrypt/live/bootstrap.example.com/privkey.pem
+```
+
 See [docs/nginx-proxy.md](docs/nginx-proxy.md) for the full nginx config with WebSocket upgrade,
 fallback page, and rate limiting.
 
@@ -138,178 +167,4 @@ fallback page, and rate limiting.
 
 ## Three users example
 
-```bash
-# Alice creates her identity
-./target/release/nullnode init
-# => Null ID: NN-ALICE-1111
-
-# Bob creates his identity
-./target/release/nullnode init
-# => Null ID: NN-BOB-2222
-
-# Carol creates her identity
-./target/release/nullnode init
-# => Null ID: NN-CAROL-3333
-
-# Alice adds Bob as a contact
-./target/release/nullnode add-contact NN-BOB-2222 --fingerprint BOB_FP
-
-# Bob adds Carol as a contact
-./target/release/nullnode add-contact NN-CAROL-3333 --fingerprint CAROL_FP
-
-# Alice sends Bob a message (Bob must be running `listen` or have a relay)
-./target/release/nullnode send NN-BOB-2222 "Hi Bob!" --fingerprint BOB_FP
-
-# Bob reads his messages
-./target/release/nullnode read
-```
-
----
-
-## What is what
-
-```
-┌─────────────┐       ┌─────────────┐       ┌─────────────┐
-│  nullnode   │       │  nullnode   │       │  nullnode   │
-│  (client)   │       │  (client)   │       │  (client)   │
-│  Alice      │       │  Bob        │       │  Carol      │
-└──────┬──────┘       └──────┬──────┘       └──────┬──────┘
-       │                     │                     │
-       │  P2P direct (when both online)             │
-       │─────────────────────│                     │
-       │                     │                     │
-       │              ┌──────┴──────┐              │
-       └──────────────│  nullnode   │──────────────┘
-                      │  (relay)    │
-                      │  (stores    │
-                      │   messages) │
-                      └──────┬──────┘
-                             │
-                      ┌──────┴──────┐
-                      │  nullnode   │
-                      │ (bootstrap) │
-                      │  (DHT seed) │
-                      └─────────────┘
-```
-
-- **Client (`nullnode`)** — your personal messenger. Manages your keys, sends messages, reads your inbox, listens for incoming connections. Run by every user.
-- **Relay (`nullnode-relay`)** — a mailbox server. Stores encrypted messages when the recipient is offline. Anyone can run one; it never sees plaintext (messages are end-to-end encrypted). Run by community operators or your own VPS.
-- **Bootstrap (`nullnode-bootstrap`)** — the DHT seed. Clients connect to it first to discover peers and relays. It does NOT handle messages. Usually you use a built-in seed; run your own only for a private network.
-
----
-
-## Docker
-
-Build and run NullNode as a container (no Rust toolchain needed).
-
-### Build the image
-
-```bash
-cd rust
-docker build -t nullnode:latest .
-```
-
-### Run commands
-
-```bash
-# Initialize identity (data persists in volume)
-docker run --rm -it -v nullnode-data:/home/nullnode/.nullnode nullnode:latest init
-
-# Show identity
-docker run --rm -it -v nullnode-data:/home/nullnode/.nullnode nullnode:latest id
-
-# Send a message
-docker run --rm -it -v nullnode-data:/home/nullnode/.nullnode nullnode:latest send NN-THEIR-ID "Hello!" --fingerprint THEIR_FP
-
-# Read messages
-docker run --rm -it -v nullnode-data:/home/nullnode/.nullnode nullnode:latest read
-```
-
-### Run the relay
-
-```bash
-docker run --rm -it -p 8765:8765 nullnode:latest nullnode-relay --host 0.0.0.0 --port 8765
-```
-
-### Run the bootstrap DHT seed
-
-```bash
-docker run --rm -it -p 9001:9001 nullnode:latest nullnode-bootstrap --host 0.0.0.0 --port 9001
-```
-
-### Notes
-
-- The image is ~50 MB (multi-stage build: Rust builder + Debian slim runtime).
-- All persistent data lives in `~/.nullnode` — mount a volume to keep it between runs.
-- The default entrypoint is `nullnode`. Use `nullnode-relay` or `nullnode-bootstrap` as the command for other binaries.
-
----
-
-## CLI reference
-
-| Command | Description |
-|---|---|
-| `init` | Create your identity (generates ML-KEM keypair) |
-| `id` | Show your Null ID and fingerprint |
-| `export` | Print your public key to share with others |
-| `import <file>` | Import a peer's public key |
-| `contacts` | List saved contacts |
-| `add-contact <NID> --fingerprint <FP>` | Add a contact with verified fingerprint |
-| `alias <name> <NID>` | Assign a human-readable name to a Null ID |
-| `aliases` | List all aliases |
-| `send <NID-or-alias> <msg>` | Send a message |
-| `read` | Read messages from relay mailbox + local store |
-| `listen` | Start P2P listener for incoming connections |
-| `chat <NID>` | Interactive chat session |
-| `verify <NID-or-alias>` | Show safety number for out-of-band verification |
-| `safety-number <NID-or-alias>` | Show safety number |
-| `status` | Show configuration and connection status |
-
-### Bootstrap server flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `--host` | `0.0.0.0` | Bind address |
-| `--port` | `9001` | Bind port |
-| `--advertised-url` | (empty) | Public URL (e.g. `wss://bootstrap.example.com/ws`) when behind nginx |
-| `--id` | (generated) | Null ID for this node |
-| `--db` | `~/.nullnode/bootstrap_dht.db` | SQLite database path |
-
----
-
-## Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `NULLNODE_RELAY` | `ws://127.0.0.1:8765` | Relay URL (fallback) |
-| `NULLNODE_DHT_BOOTSTRAP` | (3 built-in seeds) | Comma-separated DHT bootstrap URLs |
-| `NULLNODE_USE_TOR` | `false` | Route all traffic through Tor |
-| `NULLNODE_TOR_SOCKS` | `socks5://127.0.0.1:9050` | Tor SOCKS5 proxy |
-| `NULLNODE_ONION_ADDRESS` | (empty) | Pre-configured .onion address |
-| `NULLNODE_ONION_PORT` | `9001` | Port for Tor hidden service |
-
----
-
-## Documentation
-
-- **[DEVELOPER.md](DEVELOPER.md)** — Architecture, module contracts, ACS2.6 compliance status, coding guidelines
-- **[FAQ.md](FAQ.md)** — Common questions about security, encryption choices, and trade-offs
-- **[WORKLIST.md](WORKLIST.md)** — Current tasks and implementation progress
-- **[CHANGELOG.md](CHANGELOG.md)** — Version history
-
----
-
-## Supporting the project
-
-Hosting the bootstrap and relay infrastructure costs money. If you find NullNode useful, please consider supporting the project so the servers can keep running.
-
----
-
-## License
-
-Business Source License (BSL / BUSL).
-You can use the code for free, modify it, if you or your company or organisation doesn't have more than 2 people.
-
----
-Copyright (c) 2026 Andreas Mueller — gnoppix.com
-
+TODO: Add example with 3 users, relays, and bootstrap coordination.

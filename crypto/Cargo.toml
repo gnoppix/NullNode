@@ -18,5 +18,6 @@ ml-kem = { version = "0.3.2", features = ["getrandom"] }
 libc = "0.2"
 hmac.workspace = true
 zeroize.workspace = true
+blake2 = "0.10"
 
 nullnode-protocol = { path = "../protocol" }

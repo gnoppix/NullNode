@@ -163,24 +163,30 @@ pub unsafe fn alloc_guarded(data_size: usize) -> Option<NonNull<u8>> {
     let total_size = (total_size + page_size - 1) & !(page_size - 1);
 
     let layout = Layout::from_size_align(total_size, page_size).ok()?;
-    let base = alloc(layout);
+    let base = unsafe { alloc(layout) };
     if base.is_null() {
         return None;
     }
 
     // Make the first guard page inaccessible
-    let guard_before = base as *mut libc::c_void;
-    libc::mprotect(guard_before, page_size, libc::PROT_NONE);
+    unsafe {
+        let guard_before = base as *mut libc::c_void;
+        libc::mprotect(guard_before, page_size, libc::PROT_NONE);
+    }
 
     // Make the last guard page inaccessible
-    let guard_after = base.add(total_size - page_size) as *mut libc::c_void;
-    libc::mprotect(guard_after, page_size, libc::PROT_NONE);
+    unsafe {
+        let guard_after = base.add(total_size - page_size) as *mut libc::c_void;
+        libc::mprotect(guard_after, page_size, libc::PROT_NONE);
+    }
 
     // Lock the data region in RAM
-    let data_ptr = base.add(page_size) as *mut libc::c_void;
-    libc::mlock(data_ptr, data_size as libc::size_t);
+    let data_ptr = unsafe { base.add(page_size) as *mut libc::c_void };
+    unsafe {
+        libc::mlock(data_ptr, data_size as libc::size_t);
+    }
 
-    Some(NonNull::new_unchecked(data_ptr as *mut u8))
+    unsafe { Some(NonNull::new_unchecked(data_ptr as *mut u8)) }
 }
 
 /// Deallocate guarded memory with guard pages.
@@ -193,14 +199,18 @@ pub unsafe fn dealloc_guarded(ptr: NonNull<u8>, data_size: usize) {
     let total_size = page_size * 2 + data_size;
     let total_size = (total_size + page_size - 1) & !(page_size - 1);
 
-    let base = ptr.as_ptr().sub(page_size) as *mut libc::c_void;
+    let base = unsafe { ptr.as_ptr().sub(page_size) as *mut libc::c_void };
 
     // Unlock the data region
-    let data_ptr = ptr.as_ptr() as *mut libc::c_void;
-    libc::munlock(data_ptr, data_size as libc::size_t);
+    unsafe {
+        let data_ptr = ptr.as_ptr() as *mut libc::c_void;
+        libc::munlock(data_ptr, data_size as libc::size_t);
+    }
 
     // Unmap the entire region (guard pages + data)
-    libc::munmap(base, total_size as libc::size_t);
+    unsafe {
+        libc::munmap(base, total_size as libc::size_t);
+    }
 }
 
 /// Guard-page-protected key material for high-security environments.

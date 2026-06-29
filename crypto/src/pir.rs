@@ -31,7 +31,7 @@
 
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 use crate::CryptoError;
 
@@ -251,7 +251,7 @@ impl PirRegistry {
             .or_insert_with(|| vec![0u8; PIR_BIN_SIZE]);
 
         // Find an empty slot
-        for (slot_idx, slot) in bin.chunks_mut(PIR_ENTRY_SIZE).enumerate() {
+        for (_slot_idx, slot) in bin.chunks_mut(PIR_ENTRY_SIZE).enumerate() {
             if slot.iter().all(|&b| b == 0) {
                 slot.copy_from_slice(entry.to_bytes());
                 return Ok(());

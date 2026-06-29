@@ -99,7 +99,9 @@ The relay sees: sender Null ID, receiver Null ID, connection timestamps, and mes
 
 ## What happens when I receive a message while offline?
 
-When you're offline, messages are stored encrypted on the relay. When you run `nullnode read`, the client fetches those offline messages and decrypts them using your persisted DoubleRatchet sessions. The session state is updated after decryption, so future messages from the same contact continue to work correctly.
+When you're offline, messages are stored encrypted on the relay. When you run `nullnode read`, the client fetches those offline messages and decrypts them using your persisted Double Ratchet sessions. The session state is updated after decryption, so future messages from the same contact continue to work correctly — including replies in the other direction.
+
+**Bidirectional relay messaging:** Starting from v0.3.9, both directions of the Double Ratchet work through the relay. If Alice sends Bob a message while Bob is offline, Bob can later reply (also while Alice is offline) and both sides decrypt correctly when they come online.
 
 If this is your first conversation and the session was created when the message arrived (e.g., someone sent you a message and you received it via relay before ever connecting directly), the session has already been initialized and decryption works transparently.
 
@@ -110,6 +112,35 @@ If this is your first conversation and the session was created when the message 
 Yes. Starting from v0.2.4, your GPG secret key is encrypted at rest using age passphrase encryption (scrypt + XChaCha20-Poly1305). You set the passphrase during `nullnode init`. On startup, the client prompts you to enter it before the key is decrypted into memory.
 
 If you prefer not to set a passphrase, press Enter at the prompt — the key will be stored as plaintext (previous behavior). Backward compatibility with existing plaintext `own_cert.asc` files is preserved.
+
+---
+
+## I get "corrupt identity file detected" — what do I do?
+
+This error means your `~/.nullnode/gnupg/own_cert.asc` file was written by a version before v0.3.7 in a buggy way (binary data was written as text, corrupting it). Fix it:
+
+```bash
+rm -rf ~/.nullnode/gnupg
+./nullnode init
+```
+
+The new init will create a properly formatted ASCII-armored cert file.
+
+---
+
+## I get "recipient not found in DHT" — what do I do?
+
+The recipient's identity was never registered with the bootstrap DHT. This happens when:
+- The recipient ran `nullnode init` while the bootstrap was unreachable
+- The recipient is using a different bootstrap server than you
+
+Fix: On the recipient's machine, run:
+
+```bash
+./nullnode register
+```
+
+This explicitly registers the identity with the bootstrap DHT. After registration, you can send messages to them.
 
 ---
 
@@ -156,6 +187,16 @@ Relays can run in two modes:
 - **Edge mode** (default, no `--allow-relay`): only serves its own local mailboxes. Refuses to forward messages on behalf of other relays. This is appropriate for mobile or battery-powered nodes running a local relay.
 
 Edge mode prevents mobile nodes from being used as transit points in the relay federation, saving battery and bandwidth.
+
+
+### How clients discover the port:                                                                                                           
+                                                                                                                                              
+1. Relay registration - When you start relay with --url wss://relay1.nullnode.org/ws, it publishes that exact URL to the DHT (via bootstrap)        
+2. Client lookup - Client queries bootstrap → learns wss://relay-asia.gnoppix.org/ws                                                        
+3. Client connects - Client connects to wss://relay-asia.gnoppix.org/ws (port 443, standard HTTPS)                                          
+                                                                                                                                              
+The --url parameter is critical - it tells the network: "This is my public-facing address". The internal port 8765 is now never shown to      
+     clients.                  
 
 ---
 
