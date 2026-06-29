@@ -1,7 +1,6 @@
 #!/bin/bash
 # hermes-verify-build.sh - Full build verification
 set -e
-cd /home/amu/Gnoppix/messenger/rust
 
 echo "=== Build Verification ==="
 

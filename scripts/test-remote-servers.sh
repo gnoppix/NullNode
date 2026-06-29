@@ -4,7 +4,6 @@
 # Default: wss://bootstrap-eu.gnoppix.org / wss://relay-eu.gnoppix.org/ws
 set -e
 
-cd /home/amu/Gnoppix/messenger/rust
 CLIENT="./target/release/nullnode"
 
 SEED="${1:-wss://bootstrap-eu.gnoppix.org}"

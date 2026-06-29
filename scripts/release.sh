@@ -1,7 +1,6 @@
 #!/bin/bash
 # hermes-release.sh - Full release verification and build
 set -e
-cd /home/amu/Gnoppix/messenger/rust
 
 echo "==================================="
 echo "  NullNode Release Verification"

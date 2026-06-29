@@ -1,7 +1,6 @@
 #!/bin/bash
 # hermes-verify-docs.sh - Verify documentation matches source code
 set -e
-cd /home/amu/Gnoppix/messenger/rust
 
 echo "=== Documentation Verification ==="
 

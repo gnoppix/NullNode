@@ -1,6 +1,5 @@
 #!/bin/bash
 # hermes-verify-tests.sh - Run all unit tests (excluding dht-core SQLite tests)
-cd /home/amu/Gnoppix/messenger/rust
 
 echo "=== Unit Tests ==="
 

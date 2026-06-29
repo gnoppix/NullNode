@@ -1,7 +1,6 @@
 #!/bin/bash
 # hermes-verify-relay.sh - Verify relay runtime behavior
 set -e
-cd /home/amu/Gnoppix/messenger/rust
 
 echo "=== Relay Runtime Verification ==="
 
